@@ -1,0 +1,40 @@
+name: Weekly Grant Scraper
+
+# 觸發條件：每週一上午 8:00（亞洲／臺北時區）
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+      timezone: 'Asia/Taipei'
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 檢出（下載）儲存庫內容
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 安裝 Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # 安裝依賴套件與 Playwright 瀏覽器
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install --with-deps
+
+      # 執行爬蟲
+      - name: Run scraper
+        run: python grant_scraper.py
+
+      # 上傳產出檔案為 artifact，方便下載
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: grant-reports
+          path: daysee_grants_*.xlsx
