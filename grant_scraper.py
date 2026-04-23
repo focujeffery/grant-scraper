@@ -516,7 +516,4 @@ async def main() -> None:
 
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except Exception as exc:
-        logger.exception("Crawler terminated with an exception: %s", exc)
+    asyncio.run(main())
