@@ -9,6 +9,7 @@ on:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,25 +35,30 @@ jobs:
       - name: Run scraper
         run: |
           python grant_scraper.py
+          echo "=== CURRENT DIR ==="
+          pwd
+          echo "=== FILES IN ROOT ==="
           ls -la .
+          echo "=== FILES IN OUTPUTS ==="
           ls -la outputs || true
+          echo "=== FIND XLSX ==="
+          find . -maxdepth 3 -name "*.xlsx" -print
 
       - name: Upload full report
         uses: actions/upload-artifact@v4
         with:
-          name: daysee-grants-full
+          name: daysee_grants
           path: outputs/daysee_grants.xlsx
           if-no-files-found: error
 
       - name: Upload delta report
         uses: actions/upload-artifact@v4
         with:
-          name: daysee-grants-delta
+          name: daysee_grants_delta_only
           path: outputs/daysee_grants_delta_only.xlsx
           if-no-files-found: warn
 
       - name: Send email report
-        if: ${{ secrets.SMTP_HOST != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.EMAIL_TO != '' && secrets.EMAIL_FROM != '' }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -62,9 +68,5 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           ATTACH_MAIN: outputs/daysee_grants.xlsx
           ATTACH_DELTA: outputs/daysee_grants_delta_only.xlsx
-          STATS_JSON: ${{ steps.collect_stats.outputs.stats_json }}
-        run: python send_report_email.py
-
-      - name: Email not configured
-        if: ${{ !(secrets.SMTP_HOST != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.EMAIL_TO != '' && secrets.EMAIL_FROM != '') }}
-        run: echo "Email secrets not configured. Skip sending email."
+        run: |
+          python send_report_email.py
