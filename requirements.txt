@@ -1,8 +1,0 @@
-
-playwright>=1.41
-playwright-stealth>=1.0
-beautifulsoup4>=4.12
-html2text>=2020.1.16
-pydantic>=2.5
-pandas>=1.5
-openpyxl>=3.1
