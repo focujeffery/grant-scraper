@@ -6,16 +6,11 @@ on:
     - cron: '0 9 * * 1'
       timezone: 'Asia/Taipei'
 
-permissions:
-  contents: write
-
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,49 +26,33 @@ jobs:
       - name: Prepare folders
         run: |
           mkdir -p outputs
+          if [ -f state ]; then
+            rm -f state
+          fi
           mkdir -p state
 
-      - name: Run scraper and generate weekly delta
-        id: scrape
-        env:
-          OUTPUT_XLSX: outputs/daysee_grants.xlsx
-          DELTA_XLSX: outputs/daysee_grants_delta_only.xlsx
-          PREVIOUS_XLSX: state/daysee_grants_latest.xlsx
+      - name: Run scraper
         run: |
-          if [ ! -f "$PREVIOUS_XLSX" ]; then
-            unset PREVIOUS_XLSX
-          fi
-          python grant_scraper.py | tee outputs/stats.json
-          echo "stats=$(tail -n 1 outputs/stats.json)" >> $GITHUB_OUTPUT
+          python grant_scraper.py
+          ls -la .
+          ls -la outputs || true
 
-      - name: Save latest snapshot into repository state
-        run: |
-          cp outputs/daysee_grants.xlsx state/daysee_grants_latest.xlsx
-          cp outputs/daysee_grants_delta_only.xlsx state/daysee_grants_delta_latest.xlsx
-
-      - name: Commit updated state files
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state/daysee_grants_latest.xlsx state/daysee_grants_delta_latest.xlsx || true
-          git diff --cached --quiet && echo "No state changes to commit" && exit 0
-          git commit -m "chore: update weekly grant snapshot"
-          git push
-
-      - name: Upload full workbook artifact
+      - name: Upload full report
         uses: actions/upload-artifact@v4
         with:
           name: daysee-grants-full
           path: outputs/daysee_grants.xlsx
+          if-no-files-found: error
 
-      - name: Upload delta workbook artifact
+      - name: Upload delta report
         uses: actions/upload-artifact@v4
         with:
           name: daysee-grants-delta
           path: outputs/daysee_grants_delta_only.xlsx
+          if-no-files-found: warn
 
-      - name: Send weekly email
-        if: success()
+      - name: Send email report
+        if: ${{ secrets.SMTP_HOST != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.EMAIL_TO != '' && secrets.EMAIL_FROM != '' }}
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -83,6 +62,9 @@ jobs:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           ATTACH_MAIN: outputs/daysee_grants.xlsx
           ATTACH_DELTA: outputs/daysee_grants_delta_only.xlsx
-          STATS_JSON: ${{ steps.scrape.outputs.stats }}
-        run: |
-          python send_report_email.py
+          STATS_JSON: ${{ steps.collect_stats.outputs.stats_json }}
+        run: python send_report_email.py
+
+      - name: Email not configured
+        if: ${{ !(secrets.SMTP_HOST != '' && secrets.SMTP_USERNAME != '' && secrets.SMTP_PASSWORD != '' && secrets.EMAIL_TO != '' && secrets.EMAIL_FROM != '') }}
+        run: echo "Email secrets not configured. Skip sending email."
