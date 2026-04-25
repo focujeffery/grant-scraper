@@ -59,11 +59,15 @@ jobs:
           ls -la state || true
           echo "=== FIND XLSX ==="
           find . -maxdepth 3 -name "*.xlsx" -print
+          test -f outputs/daysee_grants.xlsx
 
       - name: Save latest snapshot into repository state
         run: |
           cp outputs/daysee_grants.xlsx state/daysee_grants_latest.xlsx
-          cp outputs/daysee_grants_delta_only.xlsx state/daysee_grants_delta_latest.xlsx
+          if [ -f outputs/daysee_grants_delta_only.xlsx ]; then
+            cp outputs/daysee_grants_delta_only.xlsx state/daysee_grants_delta_latest.xlsx
+          fi
+          ls -la state
 
       - name: Commit updated state files
         run: |
@@ -89,7 +93,6 @@ jobs:
           if-no-files-found: warn
 
       - name: Send weekly email
-        if: success()
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
