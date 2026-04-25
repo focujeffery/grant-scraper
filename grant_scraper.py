@@ -24,7 +24,7 @@ LISTING_URL = f"{BASE_URL}/explore-grant/"
 OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", "outputs/daysee_grants.xlsx")
 DELTA_XLSX = os.environ.get("DELTA_XLSX", "outputs/daysee_grants_delta_only.xlsx")
 STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
-PREVIOUS_SNAPSHOT = STATE_DIR / "daysee_grants_previous.xlsx"
+PREVIOUS_SNAPSHOT = Path(os.environ.get("PREVIOUS_XLSX", str(STATE_DIR / "daysee_grants_previous.xlsx")))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "25"))
 
 OFFICIAL_PORTAL_BY_SOURCE = {
@@ -522,6 +522,7 @@ def ensure_dirs():
     Path(OUTPUT_XLSX).parent.mkdir(parents=True, exist_ok=True)
     Path(DELTA_XLSX).parent.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PREVIOUS_SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
 
 
 def style_workbook(path: Path, summary_sheet: str, detail_sheet: str):
@@ -618,12 +619,14 @@ async def main():
 
     logger.info("Exported %d grants to %s", len(summary_df), output_path)
     logger.info("Exported delta workbook to %s", delta_path)
-    logger.info("Stats: %s", json.dumps({
+    stats_payload = json.dumps({
         "current_count": int(len(summary_df)),
         "new_count": int(len(new_df)),
         "updated_count": int(len(updated_df)),
         "removed_count": int(len(removed_df)),
-    }, ensure_ascii=False))
+    }, ensure_ascii=False)
+    logger.info("Stats: %s", stats_payload)
+    print(stats_payload)
 
 
 if __name__ == "__main__":
