@@ -257,6 +257,14 @@ def parse_listing_page(html: str, seen_urls: set) -> List[ListingItem]:
     return results
 
 
+def parse_total_results(html: str) -> int:
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    m = re.search(r"(\d+)\s*out\s*of\s*(\d+)\s*results", text, re.I)
+    if m:
+        return int(m.group(2))
+    return 0
+
+
 def get_domain(url: str) -> str:
     if not url:
         return ""
@@ -384,67 +392,125 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
 
 
 async def extract_all_listings(page) -> List[ListingItem]:
-    await page.goto(LISTING_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
     seen_urls: set = set()
     all_items: List[ListingItem] = []
-    stagnant = 0
+    no_growth_scans = 0
+    target_total = 0
+
     for page_no in range(1, MAX_PAGES + 1):
         logger.info("Scanning listing page %d", page_no)
         html = await page.content()
+        if not target_total:
+            target_total = parse_total_results(html)
+            if target_total:
+                logger.info("Target total grants detected: %d", target_total)
+
+        before_scan_total = len(seen_urls)
         items = parse_listing_page(html, seen_urls)
         if items:
             all_items.extend(items)
-        logger.info("Collected so far: %d", len(all_items))
 
-        before_count = len(seen_urls)
+        current_total = len(seen_urls)
+        logger.info("Collected so far: %d", current_total)
+
+        if current_total > before_scan_total:
+            no_growth_scans = 0
+        else:
+            no_growth_scans += 1
+            logger.info("No new grants detected on this scan (%d/4)", no_growth_scans)
+
+        if target_total and current_total >= target_total:
+            logger.info("Reached target total %d. Stop pagination.", target_total)
+            break
+
         next_clicked = False
-        # robust next click using JS or force click
         selectors = ["a.ts-load-next:not(.ts-btn-disabled)", "text=下一頁"]
         for sel in selectors:
             try:
                 locator = page.locator(sel)
-                if await locator.count() > 0:
-                    await locator.last.scroll_into_view_if_needed(timeout=1000)
-                    try:
-                        await locator.last.click(force=True, timeout=2500)
-                    except Exception:
-                        handle = await locator.last.element_handle()
-                        if handle:
-                            await page.evaluate("(el) => el.click()", handle)
-                    next_clicked = True
-                    break
+                if await locator.count() == 0:
+                    continue
+                btn = locator.last
+                await btn.scroll_into_view_if_needed(timeout=1500)
+                try:
+                    await btn.click(force=True, timeout=3500)
+                except Exception:
+                    handle = await btn.element_handle()
+                    if handle:
+                        await page.evaluate("(el) => el.click()", handle)
+                next_clicked = True
+                break
             except Exception:
                 continue
+
         if not next_clicked:
             logger.info("No usable next button found; stop pagination.")
             break
 
-        await page.wait_for_timeout(1800)
+        await page.wait_for_timeout(2500)
         try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
+            await page.wait_for_load_state("networkidle", timeout=7000)
         except Exception:
             pass
-        html_after = await page.content()
-        after_seen_probe = set(seen_urls)
-        probe_items = parse_listing_page(html_after, after_seen_probe)
-        if len(after_seen_probe) <= before_count:
-            stagnant += 1
-            logger.info("Pagination did not advance after click (%d/2)", stagnant)
-        else:
-            stagnant = 0
-        if stagnant >= 2:
-            logger.info("Stop pagination because there is no further progress.")
+
+        if no_growth_scans >= 4:
+            logger.info("Stop pagination because multiple scans produced no further growth.")
             break
+
     return all_items
 
 
-async def extract_detail(page, detail_url: str) -> DetailItem:
+def detail_from_listing(item: ListingItem, status: str) -> DetailItem:
+    return DetailItem(
+        title=item.title,
+        detail_url=item.detail_url,
+        plan_source=item.plan_source,
+        eligible_targets=item.eligible_targets,
+        applicable_region=item.applicable_region,
+        grant_amount=item.grant_amount,
+        organizer_site_url=item.detail_url,
+        organizer_site_domain=get_domain(item.detail_url),
+        official_url_status=status,
+        deadline_date=item.deadline_date,
+        deadline_text=item.deadline_text,
+        topic_1=item.topic_1,
+        topic_2=item.topic_2,
+        topic_3=item.topic_3,
+        topic_4=item.topic_4,
+        topic_5=item.topic_5,
+    )
+
+async def extract_detail(page, item: ListingItem) -> DetailItem:
+    detail_url = item.detail_url
     logger.info("Fetching detail: %s", detail_url)
-    await page.goto(detail_url, wait_until="domcontentloaded")
-    await page.wait_for_timeout(1200)
-    html = await page.content()
-    return parse_detail_page(html, detail_url)
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            await page.goto(detail_url, wait_until="domcontentloaded", timeout=90000)
+            await page.wait_for_timeout(1500)
+            html = await page.content()
+            return parse_detail_page(html, detail_url)
+        except PlaywrightTimeoutError as exc:
+            last_exc = exc
+            logger.warning("Detail timeout for %s (attempt %d/3)", detail_url, attempt)
+            try:
+                await page.goto("about:blank", wait_until="load", timeout=10000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200 * attempt)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Detail fetch failed for %s (attempt %d/3): %s", detail_url, attempt, exc)
+            try:
+                await page.goto("about:blank", wait_until="load", timeout=10000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(1200 * attempt)
+
+    logger.error("Fallback to listing-only detail for %s because detail page could not be read: %s", detail_url, last_exc)
+    return detail_from_listing(item, "detail_timeout_fallback")
 
 
 def dataframe_from_details(details: List[DetailItem]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -572,7 +638,7 @@ async def main():
         details: List[DetailItem] = []
         detail_page = await context.new_page()
         for item in listings:
-            detail = await extract_detail(detail_page, item.detail_url)
+            detail = await extract_detail(detail_page, item)
             # fallback to listing fields when detail top fields are blank
             if not detail.plan_source:
                 detail.plan_source = item.plan_source
