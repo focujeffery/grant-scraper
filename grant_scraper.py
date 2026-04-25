@@ -2,685 +2,601 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
-import time
-from dataclasses import dataclass
+import shutil
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from pydantic import BaseModel, Field, HttpUrl, field_validator
-from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
-
-try:
-    from playwright_stealth import stealth_async as _stealth
-except Exception:
-    _stealth = None
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-REQUEST_TIMEOUT = 20
+BASE_URL = "https://dayseechat.com"
+LISTING_URL = f"{BASE_URL}/explore-grant/"
+OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", "outputs/daysee_grants.xlsx")
+DELTA_XLSX = os.environ.get("DELTA_XLSX", "outputs/daysee_grants_delta_only.xlsx")
+STATE_DIR = Path(os.environ.get("STATE_DIR", "state"))
+PREVIOUS_SNAPSHOT = STATE_DIR / "daysee_grants_previous.xlsx"
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "25"))
 
-LOCAL_GOV_HOSTS = {
-    "台北": "www.gov.taipei",
-    "臺北": "www.gov.taipei",
-    "新北": "www.ntpc.gov.tw",
-    "基隆": "www.klcg.gov.tw",
-    "桃園": "www.tycg.gov.tw",
-    "新竹市": "www.hccg.gov.tw",
-    "新竹縣": "www.hsinchu.gov.tw",
-    "苗栗": "www.miaoli.gov.tw",
-    "台中": "www.taichung.gov.tw",
-    "臺中": "www.taichung.gov.tw",
-    "彰化": "www.chcg.gov.tw",
-    "南投": "www.nantou.gov.tw",
-    "雲林": "www.yunlin.gov.tw",
-    "嘉義市": "www.chiayi.gov.tw",
-    "嘉義縣": "www.cyhg.gov.tw",
-    "台南": "www.tainan.gov.tw",
-    "臺南": "www.tainan.gov.tw",
-    "高雄": "www.kcg.gov.tw",
-    "屏東": "www.pthg.gov.tw",
-    "宜蘭": "www.e-land.gov.tw",
-    "花蓮": "www.hl.gov.tw",
-    "台東": "www.taitung.gov.tw",
-    "臺東": "www.taitung.gov.tw",
-    "澎湖": "www.penghu.gov.tw",
-    "金門": "www.kinmen.gov.tw",
-    "連江": "www.matsu.gov.tw",
+OFFICIAL_PORTAL_BY_SOURCE = {
+    "勞動部": "https://www.mol.gov.tw/",
+    "數位發展部": "https://moda.gov.tw/",
+    "客家委員會": "https://www.hakka.gov.tw/",
+    "原住民族委員會": "https://www.cip.gov.tw/",
+    "國家發展委員會": "https://www.ndc.gov.tw/",
+    "海洋委員會": "https://www.oac.gov.tw/",
+    "文化部": "https://www.moc.gov.tw/",
+    "教育部": "https://www.edu.tw/",
+    "經濟部": "https://www.moea.gov.tw/",
+    "衛生福利部": "https://www.mohw.gov.tw/",
+    "農業部": "https://www.moa.gov.tw/",
+    "環境部": "https://www.moenv.gov.tw/",
+    "內政部": "https://www.moi.gov.tw/",
+    "交通部": "https://www.motc.gov.tw/",
+    "外交部": "https://www.mofa.gov.tw/",
+    "法務部": "https://www.moj.gov.tw/",
+    "體育署": "https://www.sa.gov.tw/",
+    "觀光署": "https://www.taiwan.net.tw/",
+    "中小及新創企業署": "https://www.sme.gov.tw/",
 }
 
-CENTRAL_SOURCE_HINTS = {
-    "勞動部": ["www.mol.gov.tw", "wlb.mol.gov.tw"],
-    "數位發展部": ["www.moda.gov.tw", "digiplus.adi.gov.tw"],
-    "客家委員會": ["www.hakka.gov.tw"],
-    "原住民族委員會": ["www.cip.gov.tw"],
-    "教育部": ["www.moe.gov.tw"],
-    "文化部": ["www.moc.gov.tw"],
-    "國家發展委員會": ["www.ndc.gov.tw"],
-    "海洋委員會": ["www.oac.gov.tw"],
-    "經濟部": ["www.moea.gov.tw", "www.sme.gov.tw"],
-    "農業部": ["www.moa.gov.tw"],
-    "環境部": ["www.moenv.gov.tw"],
+OFFICIAL_PORTAL_BY_REGION = {
+    "臺北市": "https://www.gov.taipei/",
+    "台北市": "https://www.gov.taipei/",
+    "新北市": "https://www.newtaipei.gov.tw/",
+    "桃園市": "https://www.tycg.gov.tw/",
+    "臺中市": "https://www.taichung.gov.tw/",
+    "台中市": "https://www.taichung.gov.tw/",
+    "臺南市": "https://www.tainan.gov.tw/",
+    "台南市": "https://www.tainan.gov.tw/",
+    "高雄市": "https://www.kcg.gov.tw/",
+    "基隆市": "https://www.klcg.gov.tw/",
+    "新竹市": "https://www.hccg.gov.tw/",
+    "新竹縣": "https://www.hsinchu.gov.tw/",
+    "苗栗縣": "https://www.miaoli.gov.tw/",
+    "彰化縣": "https://www.chcg.gov.tw/",
+    "南投縣": "https://www.nantou.gov.tw/",
+    "雲林縣": "https://www.yunlin.gov.tw/",
+    "嘉義市": "https://www.chiayi.gov.tw/",
+    "嘉義縣": "https://www.cyhg.gov.tw/",
+    "屏東縣": "https://www.pthg.gov.tw/",
+    "宜蘭縣": "https://www.ilan.gov.tw/",
+    "花蓮縣": "https://www.hl.gov.tw/",
+    "臺東縣": "https://www.taitung.gov.tw/",
+    "台東縣": "https://www.taitung.gov.tw/",
+    "澎湖縣": "https://www.penghu.gov.tw/",
+    "金門縣": "https://www.kinmen.gov.tw/",
+    "連江縣": "https://www.matsu.gov.tw/",
 }
 
-BAD_HOST_KEYWORDS = [
+MANUAL_OVERRIDES = {
+    "115年促轉基金還原歷史真相旗艦計畫": "https://www.ndc.gov.tw/nc_14813_40016",
+    "115年補助辦理兒童及少年未來教育與發展帳戶家戶訪視計畫": "https://www.sw.ntpc.gov.tw/",
+    "115年度新北市政府鼓勵廠商國內外參展補助計畫": "https://www.economic.ntpc.gov.tw/Api/News/Page?id=7127",
+    "115年度新北市社區營造一般性計畫": "https://www.culture.ntpc.gov.tw/",
+    "2026新竹市政府青年AI數位工具補助": "https://youthhsinchu.hccg.gov.tw/",
+    "115年親海無礙海洋創生行動方案": "https://www.oac.gov.tw/",
+}
+
+BAD_DOMAINS = {
+    "www.google.com",
     "google.com",
+    "support.google.com",
+    "www.bing.com",
     "bing.com",
-    "duckduckgo.com",
+    "www.104.com.tw",
     "104.com.tw",
-    "facebook.com",
-    "instagram.com",
-    "youtube.com",
-    "x.com",
-    "threads.net",
-    "line.me",
-]
-
-TRACKED_FIELDS = [
-    "title",
-    "plan_source",
-    "eligible_targets",
-    "applicable_region",
-    "grant_amount",
-    "deadline_date",
-    "deadline_text",
-    "organizer_site_url",
-    "official_organizer_site_url",
-    "official_url_status",
-]
-
-
-class GrantSummary(BaseModel):
-    title: str
-    url: HttpUrl
-    topics: List[str] = Field(default_factory=list)
-    recipients: List[str] = Field(default_factory=list)
-    sources: List[str] = Field(default_factory=list)
-    amount: Optional[str] = None
-    deadline: Optional[str] = None
-
-    @field_validator("deadline", mode="before")
-    @classmethod
-    def clean_deadline(cls, value: Any) -> Optional[str]:
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-
-class GrantDetail(BaseModel):
-    title: str
-    plan_source: Optional[str] = None
-    eligible_targets: Optional[str] = None
-    applicable_region: Optional[str] = None
-    grant_amount: Optional[str] = None
-    deadline_date: Optional[str] = None
-    deadline_text: Optional[str] = None
-    topic_1: Optional[str] = None
-    topic_2: Optional[str] = None
-    topic_3: Optional[str] = None
-    topic_4: Optional[str] = None
-    topic_5: Optional[str] = None
-    organizer_site_url_raw: Optional[str] = None
-    organizer_search_query: Optional[str] = None
-    organizer_site_url: Optional[str] = None
-    organizer_site_domain: Optional[str] = None
-    official_organizer_site_url: Optional[str] = None
-    official_organizer_domain: Optional[str] = None
-    official_url_status: Optional[str] = None
-    detail_url: str
-    plan_background: Optional[str] = None
-    plan_key_points: Optional[str] = None
-    application_tips: Optional[str] = None
-    raw_text: Optional[str] = None
+}
 
 
 @dataclass
-class Resolution:
-    organizer_url: Optional[str]
-    organizer_domain: Optional[str]
-    official_url: Optional[str]
-    official_domain: Optional[str]
-    status: str
-    search_query: Optional[str]
+class ListingItem:
+    title: str
+    detail_url: str
+    plan_source: str = ""
+    eligible_targets: str = ""
+    applicable_region: str = ""
+    grant_amount: str = ""
+    deadline_date: str = ""
+    deadline_text: str = ""
+    topic_1: str = ""
+    topic_2: str = ""
+    topic_3: str = ""
+    topic_4: str = ""
+    topic_5: str = ""
 
 
-class SearchResolver:
-    def __init__(self) -> None:
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"})
-        self.cache: Dict[str, Resolution] = {}
-
-    def resolve(self, raw_url: Optional[str], title: str, plan_source: Optional[str], region: Optional[str]) -> Resolution:
-        cache_key = json.dumps([raw_url, title, plan_source, region], ensure_ascii=False)
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-
-        raw_url = (raw_url or "").strip() or None
-        if raw_url and self._is_direct_candidate(raw_url):
-            validated = self._validate_url(raw_url)
-            if validated:
-                res = Resolution(validated, self._host(validated), validated, self._host(validated), "direct_non_google", None)
-                self.cache[cache_key] = res
-                return res
-
-        official_hosts = self._official_hosts(plan_source, region, title)
-        query = self._extract_query(raw_url) or self._normalize_title(title)
-
-        for host in official_hosts:
-            found = self._search_bing_site(query, host, title)
-            if found:
-                validated = self._validate_url(found)
-                if validated:
-                    res = Resolution(validated, self._host(validated), validated, self._host(validated), "bing_site_verified", query)
-                    self.cache[cache_key] = res
-                    return res
-
-        if raw_url and self._is_direct_candidate(raw_url):
-            validated = self._validate_url(raw_url)
-            if validated:
-                res = Resolution(validated, self._host(validated), validated, self._host(validated), "direct_official", query)
-                self.cache[cache_key] = res
-                return res
-
-        for host in official_hosts:
-            homepage = self._validate_url(f"https://{host}/")
-            if homepage:
-                res = Resolution(homepage, self._host(homepage), homepage, self._host(homepage), "verified_portal_homepage", query)
-                self.cache[cache_key] = res
-                return res
-
-        fallback = raw_url or f"https://www.google.com/search?q={quote_plus(query)}"
-        res = Resolution(fallback, self._host(fallback), None, None, "bing_title_no_match", query)
-        self.cache[cache_key] = res
-        return res
-
-    def _official_hosts(self, plan_source: Optional[str], region: Optional[str], title: str) -> List[str]:
-        hosts: List[str] = []
-        source = (plan_source or "").strip()
-        if source in CENTRAL_SOURCE_HINTS:
-            hosts.extend(CENTRAL_SOURCE_HINTS[source])
-        if source == "縣市政府":
-            reg = region or self._extract_region_from_text(title)
-            host = LOCAL_GOV_HOSTS.get(reg or "")
-            if host:
-                hosts.append(host)
-        else:
-            reg = self._extract_region_from_text(title) or region
-            if reg and reg in LOCAL_GOV_HOSTS:
-                hosts.append(LOCAL_GOV_HOSTS[reg])
-        # unique preserving order
-        seen = set()
-        ordered = []
-        for h in hosts:
-            if h not in seen:
-                seen.add(h)
-                ordered.append(h)
-        return ordered
-
-    def _extract_region_from_text(self, text: Optional[str]) -> Optional[str]:
-        text = text or ""
-        for key in LOCAL_GOV_HOSTS:
-            if key in text:
-                return key
-        return None
-
-    def _extract_query(self, raw_url: Optional[str]) -> Optional[str]:
-        if not raw_url:
-            return None
-        parsed = urlparse(raw_url)
-        if "google." in parsed.netloc and parsed.path.startswith("/search"):
-            q = parse_qs(parsed.query).get("q", [None])[0]
-            return unquote(q) if q else None
-        return None
-
-    def _normalize_title(self, title: str) -> str:
-        text = re.sub(r"^\d{2,3}年度", "", title)
-        text = re.sub(r"^\d{4}", "", text)
-        return text.strip()
-
-    def _is_direct_candidate(self, url: str) -> bool:
-        host = self._host(url)
-        return bool(host) and all(bad not in host for bad in BAD_HOST_KEYWORDS)
-
-    def _host(self, url: str) -> Optional[str]:
-        try:
-            return urlparse(url).netloc or None
-        except Exception:
-            return None
-
-    def _validate_url(self, url: str) -> Optional[str]:
-        candidates = [url]
-        parsed = urlparse(url)
-        host = parsed.netloc
-        if host and not host.startswith("www."):
-            candidates.append(url.replace(f"//{host}", f"//www.{host}", 1))
-        elif host and host.startswith("www."):
-            naked = host[4:]
-            candidates.append(url.replace(f"//{host}", f"//{naked}", 1))
-        for candidate in candidates:
-            try:
-                r = self.session.get(candidate, allow_redirects=True, timeout=REQUEST_TIMEOUT)
-                final_host = urlparse(r.url).netloc.lower()
-                if r.status_code < 400 and final_host and all(bad not in final_host for bad in BAD_HOST_KEYWORDS):
-                    return r.url
-            except requests.RequestException:
-                continue
-        return None
-
-    def _search_bing_site(self, query: str, host: str, title: str) -> Optional[str]:
-        queries = [
-            f'site:{host} "{title}"',
-            f'site:{host} "{query}" 補助',
-            f'site:{host} "{query}" 公告',
-            f'site:{host} "{query}" PDF',
-        ]
-        for q in queries:
-            try:
-                url = f"https://www.bing.com/search?q={quote_plus(q)}"
-                resp = self.session.get(url, timeout=REQUEST_TIMEOUT)
-                if resp.status_code >= 400:
-                    continue
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for a in soup.select("li.b_algo h2 a"):
-                    href = (a.get("href") or "").strip()
-                    if not href:
-                        continue
-                    host_found = self._host(href) or ""
-                    if host in host_found or host_found.endswith(host.replace("www.", "")):
-                        return href
-            except requests.RequestException:
-                continue
-        return None
+@dataclass
+class DetailItem:
+    title: str
+    detail_url: str
+    plan_source: str = ""
+    eligible_targets: str = ""
+    applicable_region: str = ""
+    grant_amount: str = ""
+    organizer_site_url_raw: str = ""
+    organizer_search_query: str = ""
+    organizer_site_url: str = ""
+    organizer_site_domain: str = ""
+    official_organizer_site_url: str = ""
+    official_organizer_domain: str = ""
+    official_url_status: str = ""
+    application_note: str = ""
+    deadline_date: str = ""
+    deadline_text: str = ""
+    topic_1: str = ""
+    topic_2: str = ""
+    topic_3: str = ""
+    topic_4: str = ""
+    topic_5: str = ""
+    background: str = ""
+    key_point_1: str = ""
+    key_point_2: str = ""
+    key_point_3: str = ""
+    key_point_4: str = ""
+    key_point_5: str = ""
+    writing_tips: str = ""
+    raw_text: str = ""
 
 
-def get_crawl_delay(domain: str) -> float:
-    robots_url = f"{domain.rstrip('/')}/robots.txt"
-    try:
-        r = requests.get(robots_url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
-        text = r.text
-    except requests.RequestException:
-        return 0.0
-    current_agent = None
-    crawl_delay = 0.0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+def clean_text(value: str) -> str:
+    if value is None:
+        return ""
+    value = str(value).replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def split_lines(text: str) -> List[str]:
+    lines = []
+    for raw in text.splitlines():
+        s = raw.strip().strip("•").strip("▪").strip("-").strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def parse_deadline_and_topics(lines: List[str], start_idx: int) -> Tuple[str, List[str]]:
+    date_value = ""
+    topics: List[str] = []
+    for idx in range(start_idx + 1, min(len(lines), start_idx + 8)):
+        line = lines[idx]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", line):
+            date_value = line
             continue
-        m = re.match(r"user-agent:\s*(.*)", line, re.I)
-        if m:
-            current_agent = m.group(1).strip()
+        if line.startswith("#本資訊") or line.startswith("▎") or line.startswith("計畫簡介"):
+            break
+        if not any(x in line for x in ["計畫", "補助", "來源", "對象", "金額", "地區"]):
+            topics.append(line)
+    return date_value, topics[:5]
+
+
+def extract_after_label(lines: List[str], label: str, stop_labels: List[str]) -> List[str]:
+    results: List[str] = []
+    active = False
+    for line in lines:
+        if line.startswith(label):
+            active = True
             continue
-        if current_agent in ("*", None):
-            d = re.match(r"crawl-delay:\s*(\d+)", line, re.I)
-            if d:
-                crawl_delay = float(d.group(1))
-    return crawl_delay
+        if active and any(line.startswith(stop) for stop in stop_labels):
+            break
+        if active:
+            results.append(line)
+    return results
 
 
-def clean_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def clean_multiline_text(text: str) -> str:
-    lines = [clean_text(line) for line in (text or "").splitlines()]
-    lines = [line for line in lines if line]
-    return "\n".join(lines)
-
-
-def extract_labeled_block(text: str, label: str, next_labels: List[str]) -> Optional[str]:
-    if not text:
-        return None
-    boundary = "|".join(re.escape(x) for x in next_labels)
+def extract_sections_from_text(text: str) -> Dict[str, str]:
+    sections: Dict[str, str] = {}
     patterns = [
-        rf"{re.escape(label)}\s*[：:]\s*(.*?)(?=\n(?:{boundary})\s*[：:]|\Z)",
-        rf"{re.escape(label)}\s*[：:]\s*(.*?)(?=\n(?:{boundary})|\Z)",
+        ("background", r"###\s*計畫背景\s*(.*?)\s*(?=###\s*計畫重點|###\s*撰寫技巧|$)"),
+        ("key_points", r"###\s*計畫重點\s*(.*?)\s*(?=###\s*撰寫技巧|$)"),
+        ("writing_tips", r"###\s*撰寫技巧\s*(.*?)\s*(?=返回主頁|##\s*你可能也會喜歡|$)"),
     ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.S)
-        if m:
-            value = clean_text(m.group(1))
-            if value:
-                return value
-    return None
+    for key, pat in patterns:
+        m = re.search(pat, text, re.S)
+        sections[key] = m.group(1).strip() if m else ""
+    return sections
 
 
-def extract_section_block(text: str, start_labels: List[str], end_labels: List[str]) -> Optional[str]:
-    if not text:
-        return None
-    start_pat = "|".join(re.escape(x) for x in start_labels)
-    end_pat = "|".join(re.escape(x) for x in end_labels) if end_labels else None
-    if end_pat:
-        pattern = rf"(?:^|\n)(?:{start_pat})\s*\n?(.*?)(?=\n(?:{end_pat})\b|\Z)"
-    else:
-        pattern = rf"(?:^|\n)(?:{start_pat})\s*\n?(.*?)(?=\Z)"
-    m = re.search(pattern, text, flags=re.S)
-    if not m:
-        return None
-    value = clean_text(m.group(1))
-    return value or None
-
-
-def extract_deadline_parts(deadline_text: Optional[str], topics: List[str]) -> Tuple[Optional[str], Optional[str]]:
-    if not deadline_text:
-        return None, None
-    date_match = re.search(r"(20\d{2}-\d{2}-\d{2})", deadline_text)
-    date_part = date_match.group(1) if date_match else None
-    tags = [t for t in topics if t]
-    text_part = "｜".join(tags) if tags else re.sub(r"^.*?(20\d{2}-\d{2}-\d{2})", "", deadline_text).strip("｜ ")
-    return date_part, text_part or None
-
-
-def style_workbook(path: Path) -> None:
-    wb = load_workbook(path)
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    width_map = {
-        "title": 34,
-        "plan_source": 18,
-        "eligible_targets": 22,
-        "applicable_region": 14,
-        "grant_amount": 16,
-        "deadline_date": 14,
-        "deadline_text": 22,
-        "topic_1": 12,
-        "topic_2": 12,
-        "topic_3": 12,
-        "topic_4": 12,
-        "topic_5": 12,
-        "organizer_site_url_raw": 34,
-        "organizer_search_query": 28,
-        "organizer_site_url": 34,
-        "organizer_site_domain": 22,
-        "official_organizer_site_url": 34,
-        "official_organizer_domain": 22,
-        "official_url_status": 24,
-        "detail_url": 34,
-        "plan_background": 42,
-        "plan_key_points": 42,
-        "application_tips": 42,
-        "raw_text": 56,
-        "changed_fields": 24,
-        "metric": 20,
-        "value": 20,
-    }
-    for ws in wb.worksheets:
-        ws.freeze_panes = "A2"
-        ws.row_dimensions[1].height = 24
-        headers = [cell.value for cell in ws[1]]
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        for idx, header in enumerate(headers, start=1):
-            col_letter = ws.cell(row=1, column=idx).column_letter
-            target_width = width_map.get(str(header), None)
-            if target_width:
-                ws.column_dimensions[col_letter].width = target_width
-            else:
-                max_len = 0
-                for c in ws[col_letter]:
-                    c.alignment = Alignment(wrap_text=True, vertical="top")
-                    value = "" if c.value is None else str(c.value)
-                    max_len = max(max_len, min(len(value), 40))
-                ws.column_dimensions[col_letter].width = max(12, min(max_len + 2, 28))
-        for row in range(2, ws.max_row + 1):
-            ws.row_dimensions[row].height = 18
-        for row in ws.iter_rows(min_row=2):
-            for c in row:
-                c.alignment = Alignment(wrap_text=True, vertical="top")
-        if ws.title in {"grants_detail", "new_plans", "updated_plans", "removed_plans", "weekly_new_plans", "weekly_updated_plans", "weekly_removed_plans"}:
-            for row in range(2, ws.max_row + 1):
-                ws.row_dimensions[row].height = 42
-    wb.save(path)
-
-
-class GrantCrawler:
-    def __init__(self, base_url: str = "https://dayseechat.com") -> None:
-        self.base_url = base_url.rstrip("/")
-        self.listing_url = f"{self.base_url}/explore-grant/"
-        self.resolver = SearchResolver()
-
-    async def _new_context(self, p) -> BrowserContext:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=USER_AGENT, locale="zh-TW", extra_http_headers={"Accept-Language": "zh-TW,zh;q=0.9"})
-        return context
-
-    async def _apply_stealth(self, page: Page) -> None:
-        if _stealth is not None:
-            try:
-                await _stealth(page)
-            except Exception:
-                pass
-
-    async def extract_listings(self, page: Page) -> List[GrantSummary]:
-        await page.goto(self.listing_url, wait_until="networkidle")
-        await self._apply_stealth(page)
-        await page.wait_for_selector("a.ts-action-con")
-        seen: Dict[str, GrantSummary] = {}
-        last_first_title = None
-        for page_no in range(1, 30):
-            logger.info("Scanning listing page %d", page_no)
-            cards = await page.query_selector_all("a.ts-action-con")
-            current_titles = []
-            for a in cards:
-                href = await a.get_attribute("href")
-                title = (await a.get_attribute("aria-label")) or await a.inner_text()
-                title = clean_text(title)
-                if href and title and "/subsidy/grant-" in href and href not in seen:
-                    current_titles.append(title)
-                    seen[href] = GrantSummary(title=title, url=href)
-            if current_titles:
-                if last_first_title == current_titles[0]:
-                    break
-                last_first_title = current_titles[0]
-            next_btn = await page.query_selector("a.ts-load-next:not(.ts-btn-disabled)")
-            if not next_btn:
+def parse_listing_page(html: str, seen_urls: set) -> List[ListingItem]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: List[ListingItem] = []
+    for a in soup.select('a[href*="/subsidy/grant-"]'):
+        href = urljoin(BASE_URL, a.get("href", "").strip())
+        if not href or href in seen_urls:
+            continue
+        title = clean_text(a.get_text(" ", strip=True))
+        if not title:
+            continue
+        block = a
+        for _ in range(8):
+            txt = block.get_text("\n", strip=True) if hasattr(block, "get_text") else ""
+            if "截止日期" in txt and ("計畫來源" in txt or "補助對象" in txt):
                 break
-            try:
-                await next_btn.scroll_into_view_if_needed()
-                await page.evaluate("el => el.click()", next_btn)
-                await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(random.uniform(0.8, 1.4))
-            except PlaywrightTimeoutError:
+            if getattr(block, "parent", None) is None:
                 break
-        return list(seen.values())
-
-    async def extract_detail(self, context: BrowserContext, summary: GrantSummary) -> GrantDetail:
-        page = await context.new_page()
-        try:
-            logger.info("Fetching detail: %s", summary.url)
-            await page.goto(str(summary.url), wait_until="networkidle")
-            await self._apply_stealth(page)
-            await page.wait_for_selector("body")
-            raw_body_text = await page.locator("body").inner_text()
-            multiline_text = clean_multiline_text(raw_body_text)
-            top_text = multiline_text.split("#本資訊為AI生成工具協助彙整")[0]
-            top_text = top_text.split("▎ 計畫簡介")[0]
-            title = summary.title
-
-            label_order = ["計畫來源", "補助對象", "適用地區", "補助金額", "申請文件", "截止日期"]
-            plan_source = extract_labeled_block(top_text, "計畫來源", label_order[1:])
-            eligible = extract_labeled_block(top_text, "補助對象", label_order[2:])
-            region = extract_labeled_block(top_text, "適用地區", label_order[3:])
-            amount = extract_labeled_block(top_text, "補助金額", label_order[4:])
-            deadline_line = extract_labeled_block(top_text, "截止日期", ["計畫簡介", "計畫背景", "【計畫背景】"])
-
-            if deadline_line and not re.search(r"20\d{2}-\d{2}-\d{2}", deadline_line):
-                m = re.search(r"截止日期\s*[：:]\s*(.*)$", top_text)
+            block = block.parent
+        lines = split_lines(block.get_text("\n", strip=True))
+        topics = extract_after_label(lines, "＃關注議題：", ["＃補助對象：", "＃計畫來源：", "＃補助金額：", "截止日期："])
+        recipients = extract_after_label(lines, "＃補助對象：", ["＃計畫來源：", "＃補助金額：", "截止日期："])
+        sources = extract_after_label(lines, "＃計畫來源：", ["＃補助金額：", "截止日期："])
+        amounts = extract_after_label(lines, "＃補助金額：", ["截止日期："])
+        deadline_date = ""
+        for line in lines:
+            if line.startswith("截止日期："):
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", line)
                 if m:
-                    deadline_line = clean_text(m.group(1))
-
-            topic_candidates: List[str] = []
-            topic_source_text = deadline_line or top_text
-            for tag in ["婦女", "產業發展", "青年", "創新創業", "農漁村議題", "客家", "文化藝文", "原住民", "生態環境", "社區議題", "孩童", "身心障礙", "地方創生", "數位轉型", "觀光旅遊"]:
-                if tag in topic_source_text and tag not in topic_candidates:
-                    topic_candidates.append(tag)
-            deadline_date, deadline_text = extract_deadline_parts(deadline_line, topic_candidates)
-            topic_cols = topic_candidates[:5] + [None] * (5 - len(topic_candidates[:5]))
-
-            plan_background = extract_section_block(multiline_text, ["計畫背景", "【計畫背景】"], ["計畫重點", "【計畫重點】", "補助重點", "申請資格", "必備文件", "計畫撰寫技巧", "【計畫撰寫技巧】", "撰寫技巧"])
-            plan_key_points = extract_section_block(multiline_text, ["計畫重點", "【計畫重點】", "補助重點", "申請資格", "必備文件"], ["計畫撰寫技巧", "【計畫撰寫技巧】", "撰寫技巧", "聯絡窗口", "注意事項"])
-            application_tips = extract_section_block(multiline_text, ["計畫撰寫技巧", "【計畫撰寫技巧】", "撰寫技巧", "申請建議"], ["聯絡窗口", "注意事項", "相關連結"])
-
-            raw_link = None
-            candidate_links = await page.query_selector_all("a[href]")
-            for a in candidate_links:
-                href = (await a.get_attribute("href") or "").strip()
-                label = clean_text(await a.inner_text())
-                if "申請文件" in label or "主辦單位" in label or "前往主辦單位網站" in label:
-                    raw_link = href
-                    break
-            if not raw_link:
-                for a in candidate_links:
-                    href = (await a.get_attribute("href") or "").strip()
-                    if "google.com/search?q=" in href:
-                        raw_link = href
-                        break
-
-            resolution = self.resolver.resolve(raw_link, title, plan_source, region)
-
-            return GrantDetail(
-                title=title,
-                plan_source=plan_source,
-                eligible_targets=eligible,
-                applicable_region=region,
-                grant_amount=amount,
-                deadline_date=deadline_date,
-                deadline_text=deadline_text,
-                topic_1=topic_cols[0],
-                topic_2=topic_cols[1],
-                topic_3=topic_cols[2],
-                topic_4=topic_cols[3],
-                topic_5=topic_cols[4],
-                organizer_site_url_raw=raw_link,
-                organizer_search_query=resolution.search_query,
-                organizer_site_url=resolution.organizer_url,
-                organizer_site_domain=resolution.organizer_domain,
-                official_organizer_site_url=resolution.official_url,
-                official_organizer_domain=resolution.official_domain,
-                official_url_status=resolution.status,
-                detail_url=str(summary.url),
-                plan_background=plan_background,
-                plan_key_points=plan_key_points,
-                application_tips=application_tips,
-                raw_text=multiline_text,
-            )
-        finally:
-            await page.close()
-
-    async def run(self) -> List[GrantDetail]:
-        crawl_delay = get_crawl_delay(self.base_url)
-        async with async_playwright() as p:
-            context = await self._new_context(p)
-            page = await context.new_page()
-            listings = await self.extract_listings(page)
-            await page.close()
-            await context.close()
-            logger.info("Found %d grants", len(listings))
-            details: List[GrantDetail] = []
-            for item in listings:
-                context = await self._new_context(p)
-                detail = await self.extract_detail(context, item)
-                details.append(detail)
-                await context.close()
-                await asyncio.sleep(crawl_delay + random.uniform(0.1, 0.5))
-        return details
+                    deadline_date = m.group(1)
+                break
+        item = ListingItem(
+            title=title,
+            detail_url=href,
+            plan_source="｜".join(sources),
+            eligible_targets="｜".join(recipients),
+            applicable_region="",
+            grant_amount="｜".join([x for x in amounts if not x.isdigit()]),
+            deadline_date=deadline_date,
+            deadline_text="",
+            topic_1=topics[0] if len(topics) > 0 else "",
+            topic_2=topics[1] if len(topics) > 1 else "",
+            topic_3=topics[2] if len(topics) > 2 else "",
+            topic_4=topics[3] if len(topics) > 3 else "",
+            topic_5=topics[4] if len(topics) > 4 else "",
+        )
+        results.append(item)
+        seen_urls.add(href)
+    return results
 
 
-def compute_changes(current: pd.DataFrame, previous: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if previous is None or previous.empty:
-        summary = pd.DataFrame([{"metric": "run_type", "value": "first_run"}, {"metric": "new_count", "value": len(current)}, {"metric": "updated_count", "value": 0}, {"metric": "removed_count", "value": 0}])
-        return summary, current.copy(), pd.DataFrame(columns=current.columns.tolist() + ["changed_fields"]), pd.DataFrame(columns=current.columns)
+def get_domain(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
 
-    curr = current.copy().set_index("detail_url", drop=False)
-    prev = previous.copy().set_index("detail_url", drop=False)
 
-    new_urls = [u for u in curr.index if u not in prev.index]
-    removed_urls = [u for u in prev.index if u not in curr.index]
-    common_urls = [u for u in curr.index if u in prev.index]
+def extract_google_query(url: str) -> str:
+    if not url or "google.com/search" not in url:
+        return ""
+    try:
+        return parse_qs(urlparse(url).query).get("q", [""])[0]
+    except Exception:
+        return ""
 
-    updated_rows = []
-    for u in common_urls:
-        changed = []
-        for field in TRACKED_FIELDS:
-            a = "" if pd.isna(curr.at[u, field]) else str(curr.at[u, field])
-            b = "" if pd.isna(prev.at[u, field]) else str(prev.at[u, field])
-            if a != b:
-                changed.append(field)
-        if changed:
-            row = curr.loc[u].to_dict()
-            row["changed_fields"] = " | ".join(changed)
-            updated_rows.append(row)
 
-    new_df = curr.loc[new_urls].reset_index(drop=True) if new_urls else pd.DataFrame(columns=current.columns)
-    removed_df = prev.loc[removed_urls].reset_index(drop=True) if removed_urls else pd.DataFrame(columns=current.columns)
-    updated_df = pd.DataFrame(updated_rows)
-    summary = pd.DataFrame(
-        [
-            {"metric": "run_type", "value": "delta_run"},
-            {"metric": "current_count", "value": len(current)},
-            {"metric": "previous_count", "value": len(previous)},
-            {"metric": "new_count", "value": len(new_df)},
-            {"metric": "updated_count", "value": len(updated_df)},
-            {"metric": "removed_count", "value": len(removed_df)},
-        ]
+def region_hint_from_text(title: str, applicable_region: str) -> str:
+    text = f"{title} {applicable_region}"
+    for key in OFFICIAL_PORTAL_BY_REGION:
+        if key in text:
+            return key
+    return ""
+
+
+def choose_official_urls(title: str, plan_source: str, applicable_region: str, raw_url: str) -> Tuple[str, str, str, str, str]:
+    raw_url = clean_text(raw_url)
+    search_query = extract_google_query(raw_url) or title
+    if title in MANUAL_OVERRIDES:
+        url = MANUAL_OVERRIDES[title]
+        dom = get_domain(url)
+        return raw_url, search_query, url, dom, "manual_verified_override"
+
+    if raw_url and raw_url.startswith("http") and get_domain(raw_url) not in BAD_DOMAINS:
+        dom = get_domain(raw_url)
+        status = "direct_official" if ".gov" in dom or dom.endswith("gov.tw") else "direct_non_google"
+        return raw_url, search_query, raw_url, dom, status
+
+    if plan_source in OFFICIAL_PORTAL_BY_SOURCE:
+        url = OFFICIAL_PORTAL_BY_SOURCE[plan_source]
+        return raw_url, search_query, url, get_domain(url), "verified_portal_homepage"
+
+    region = region_hint_from_text(title, applicable_region)
+    if region and region in OFFICIAL_PORTAL_BY_REGION:
+        url = OFFICIAL_PORTAL_BY_REGION[region]
+        return raw_url, search_query, url, get_domain(url), "verified_portal_homepage"
+
+    return raw_url, search_query, raw_url, "", "bing_title_no_match"
+
+
+def parse_detail_page(html: str, detail_url: str) -> DetailItem:
+    soup = BeautifulSoup(html, "html.parser")
+    title = clean_text((soup.select_one("h1") or soup.select_one("h2") or soup.select_one("title")).get_text(" ", strip=True))
+
+    top_text = soup.get_text("\n", strip=True)
+    lines = split_lines(top_text)
+
+    source_vals = extract_after_label(lines, "計畫來源 :", ["補助對象 :", "適用地區 :", "補助金額 :", "截止日期 :"])
+    target_vals = extract_after_label(lines, "補助對象 :", ["適用地區 :", "補助金額 :", "截止日期 :"])
+    region_vals = extract_after_label(lines, "適用地區 :", ["補助金額 :", "截止日期 :"])
+    amount_vals = extract_after_label(lines, "補助金額 :", ["截止日期 :"])
+
+    deadline_date = ""
+    topics: List[str] = []
+    for idx, line in enumerate(lines):
+        if line.startswith("截止日期 :") or line.startswith("截止日期："):
+            deadline_date, topics = parse_deadline_and_topics(lines, idx)
+            break
+
+    app_anchor = None
+    for a in soup.select("a[href]"):
+        txt = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href", "")
+        if "申請文件" in txt or "主辦單位網站" in txt:
+            app_anchor = (txt, urljoin(BASE_URL, href))
+            break
+    application_note = app_anchor[0] if app_anchor else ""
+    organizer_raw = app_anchor[1] if app_anchor else ""
+
+    sections = extract_sections_from_text(top_text)
+    key_points = split_lines(sections.get("key_points", ""))[:5]
+
+    raw_url, search_query, final_url, final_domain, status = choose_official_urls(
+        title=title,
+        plan_source="｜".join(source_vals),
+        applicable_region="｜".join(region_vals),
+        raw_url=organizer_raw,
     )
+
+    official_url = final_url if status != "bing_title_no_match" else ""
+    official_domain = final_domain if status != "bing_title_no_match" else ""
+
+    return DetailItem(
+        title=title,
+        detail_url=detail_url,
+        plan_source="｜".join(source_vals),
+        eligible_targets="｜".join(target_vals),
+        applicable_region="｜".join(region_vals),
+        grant_amount="｜".join([x for x in amount_vals if not x.startswith("申請文件") and not re.match(r"^\d+$", x)]),
+        organizer_site_url_raw=raw_url,
+        organizer_search_query=search_query,
+        organizer_site_url=final_url or raw_url,
+        organizer_site_domain=get_domain(final_url or raw_url),
+        official_organizer_site_url=official_url,
+        official_organizer_domain=official_domain,
+        official_url_status=status,
+        application_note=application_note,
+        deadline_date=deadline_date,
+        deadline_text="｜".join(topics),
+        topic_1=topics[0] if len(topics) > 0 else "",
+        topic_2=topics[1] if len(topics) > 1 else "",
+        topic_3=topics[2] if len(topics) > 2 else "",
+        topic_4=topics[3] if len(topics) > 3 else "",
+        topic_5=topics[4] if len(topics) > 4 else "",
+        background=sections.get("background", "").strip(),
+        key_point_1=key_points[0] if len(key_points) > 0 else "",
+        key_point_2=key_points[1] if len(key_points) > 1 else "",
+        key_point_3=key_points[2] if len(key_points) > 2 else "",
+        key_point_4=key_points[3] if len(key_points) > 3 else "",
+        key_point_5=key_points[4] if len(key_points) > 4 else "",
+        writing_tips=sections.get("writing_tips", "").strip(),
+        raw_text=top_text,
+    )
+
+
+async def extract_all_listings(page) -> List[ListingItem]:
+    await page.goto(LISTING_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    seen_urls: set = set()
+    all_items: List[ListingItem] = []
+    stagnant = 0
+    for page_no in range(1, MAX_PAGES + 1):
+        logger.info("Scanning listing page %d", page_no)
+        html = await page.content()
+        items = parse_listing_page(html, seen_urls)
+        if items:
+            all_items.extend(items)
+        logger.info("Collected so far: %d", len(all_items))
+
+        before_count = len(seen_urls)
+        next_clicked = False
+        # robust next click using JS or force click
+        selectors = ["a.ts-load-next:not(.ts-btn-disabled)", "text=下一頁"]
+        for sel in selectors:
+            try:
+                locator = page.locator(sel)
+                if await locator.count() > 0:
+                    await locator.last.scroll_into_view_if_needed(timeout=1000)
+                    try:
+                        await locator.last.click(force=True, timeout=2500)
+                    except Exception:
+                        handle = await locator.last.element_handle()
+                        if handle:
+                            await page.evaluate("(el) => el.click()", handle)
+                    next_clicked = True
+                    break
+            except Exception:
+                continue
+        if not next_clicked:
+            logger.info("No usable next button found; stop pagination.")
+            break
+
+        await page.wait_for_timeout(1800)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        html_after = await page.content()
+        after_seen_probe = set(seen_urls)
+        probe_items = parse_listing_page(html_after, after_seen_probe)
+        if len(after_seen_probe) <= before_count:
+            stagnant += 1
+            logger.info("Pagination did not advance after click (%d/2)", stagnant)
+        else:
+            stagnant = 0
+        if stagnant >= 2:
+            logger.info("Stop pagination because there is no further progress.")
+            break
+    return all_items
+
+
+async def extract_detail(page, detail_url: str) -> DetailItem:
+    logger.info("Fetching detail: %s", detail_url)
+    await page.goto(detail_url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(1200)
+    html = await page.content()
+    return parse_detail_page(html, detail_url)
+
+
+def dataframe_from_details(details: List[DetailItem]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    detail_df = pd.DataFrame([asdict(d) for d in details])
+    summary_cols = [
+        "title", "plan_source", "eligible_targets", "applicable_region", "grant_amount",
+        "deadline_date", "deadline_text", "topic_1", "topic_2", "topic_3", "topic_4", "topic_5",
+        "organizer_site_url_raw", "organizer_search_query", "organizer_site_url", "organizer_site_domain",
+        "official_organizer_site_url", "official_organizer_domain", "official_url_status", "detail_url",
+    ]
+    detail_cols = [
+        "title", "detail_url", "plan_source", "eligible_targets", "applicable_region", "grant_amount",
+        "organizer_site_url_raw", "organizer_search_query", "organizer_site_url", "organizer_site_domain",
+        "official_organizer_site_url", "official_organizer_domain", "official_url_status", "application_note",
+        "deadline_date", "deadline_text", "topic_1", "topic_2", "topic_3", "topic_4", "topic_5",
+        "background", "key_point_1", "key_point_2", "key_point_3", "key_point_4", "key_point_5",
+        "writing_tips", "raw_text",
+    ]
+    for col in summary_cols + detail_cols:
+        if col not in detail_df.columns:
+            detail_df[col] = ""
+    summary_df = detail_df[summary_cols].copy()
+    detail_df = detail_df[detail_cols].copy()
+    return summary_df, detail_df
+
+
+def _row_signature(row: pd.Series) -> str:
+    keep_cols = [
+        "title", "plan_source", "eligible_targets", "applicable_region", "grant_amount",
+        "deadline_date", "deadline_text", "organizer_site_url", "official_organizer_site_url", "official_url_status"
+    ]
+    return "||".join(clean_text(row.get(col, "")) for col in keep_cols)
+
+
+def build_delta(summary_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if PREVIOUS_SNAPSHOT.exists():
+        try:
+            prev_summary = pd.read_excel(PREVIOUS_SNAPSHOT, sheet_name="grants_summary")
+        except Exception:
+            prev_summary = pd.DataFrame(columns=summary_df.columns)
+    else:
+        prev_summary = pd.DataFrame(columns=summary_df.columns)
+
+    current = summary_df.copy()
+    prev = prev_summary.copy()
+    for df in (current, prev):
+        if "detail_url" not in df.columns:
+            df["detail_url"] = ""
+        df["detail_url"] = df["detail_url"].astype(str)
+        df["_sig"] = df.apply(_row_signature, axis=1) if len(df) else []
+
+    prev_map = {r["detail_url"]: r["_sig"] for _, r in prev.iterrows() if r.get("detail_url")}
+    curr_map = {r["detail_url"]: r["_sig"] for _, r in current.iterrows() if r.get("detail_url")}
+
+    new_urls = sorted(set(curr_map) - set(prev_map))
+    removed_urls = sorted(set(prev_map) - set(curr_map))
+    updated_urls = sorted(url for url in set(curr_map) & set(prev_map) if curr_map[url] != prev_map[url])
+
+    new_df = current[current["detail_url"].isin(new_urls)].drop(columns=["_sig"], errors="ignore")
+    updated_df = current[current["detail_url"].isin(updated_urls)].drop(columns=["_sig"], errors="ignore")
+    removed_df = prev[prev["detail_url"].isin(removed_urls)].drop(columns=["_sig"], errors="ignore")
+
+    summary = pd.DataFrame([
+        {"metric": "current_count", "value": len(current)},
+        {"metric": "previous_count", "value": len(prev)},
+        {"metric": "new_count", "value": len(new_df)},
+        {"metric": "updated_count", "value": len(updated_df)},
+        {"metric": "removed_count", "value": len(removed_df)},
+        {"metric": "generated_at", "value": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")},
+    ])
     return summary, new_df, updated_df, removed_df
 
 
-def write_outputs(details: List[GrantDetail], output_path: Path, delta_output_path: Path, previous_xlsx: Optional[Path]) -> Dict[str, int]:
-    all_rows = [d.model_dump() for d in details]
-    all_df = pd.DataFrame(all_rows)
+def ensure_dirs():
+    Path(OUTPUT_XLSX).parent.mkdir(parents=True, exist_ok=True)
+    Path(DELTA_XLSX).parent.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    summary_columns = [
-        "title",
-        "plan_source",
-        "eligible_targets",
-        "applicable_region",
-        "grant_amount",
-        "deadline_date",
-        "deadline_text",
-        "topic_1",
-        "topic_2",
-        "topic_3",
-        "topic_4",
-        "topic_5",
-        "organizer_site_url_raw",
-        "organizer_search_query",
-        "organizer_site_url",
-        "organizer_site_domain",
-        "official_organizer_site_url",
-        "official_organizer_domain",
-        "official_url_status",
-        "detail_url",
-    ]
-    detail_columns = summary_columns + ["plan_background", "plan_key_points", "application_tips", "raw_text"]
 
-    summary_df = all_df.reindex(columns=summary_columns)
-    detail_df = all_df.reindex(columns=detail_columns)
+def style_workbook(path: Path, summary_sheet: str, detail_sheet: str):
+    wb = load_workbook(path)
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    wrap_cols = {"background", "writing_tips", "raw_text", "application_note", "key_point_1", "key_point_2", "key_point_3", "key_point_4", "key_point_5"}
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for col_cells in ws.columns:
+            header = col_cells[0].value or ""
+            max_len = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells[:150])
+            width = min(max(max_len + 2, 12), 45)
+            if header in wrap_cols:
+                width = 42
+            ws.column_dimensions[col_cells[0].column_letter].width = width
+            for cell in col_cells[1:]:
+                if header in wrap_cols:
+                    cell.alignment = Alignment(wrap_text=True, vertical="top")
+                else:
+                    cell.alignment = Alignment(vertical="top")
+        if ws.title == detail_sheet:
+            for row in range(2, ws.max_row + 1):
+                ws.row_dimensions[row].height = 36
+    wb.save(path)
 
-    previous_summary = None
-    if previous_xlsx and previous_xlsx.exists():
-        try:
-            previous_summary = pd.read_excel(previous_xlsx, sheet_name="grants_summary")
-        except Exception:
-            previous_summary = None
 
-    changes_summary, new_df, updated_df, removed_df = compute_changes(summary_df, previous_summary)
+async def main():
+    ensure_dirs()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(locale="zh-TW")
+        page = await context.new_page()
+        listings = await extract_all_listings(page)
+        logger.info("Found %d grants", len(listings))
+        # de-duplicate and keep stable order
+        unique_listing_map: Dict[str, ListingItem] = {}
+        for item in listings:
+            unique_listing_map[item.detail_url] = item
+        listings = list(unique_listing_map.values())
+        listings.sort(key=lambda x: x.detail_url)
 
+        details: List[DetailItem] = []
+        detail_page = await context.new_page()
+        for item in listings:
+            detail = await extract_detail(detail_page, item.detail_url)
+            # fallback to listing fields when detail top fields are blank
+            if not detail.plan_source:
+                detail.plan_source = item.plan_source
+            if not detail.eligible_targets:
+                detail.eligible_targets = item.eligible_targets
+            if not detail.grant_amount:
+                detail.grant_amount = item.grant_amount
+            if not detail.deadline_date:
+                detail.deadline_date = item.deadline_date
+            if not detail.deadline_text:
+                detail.deadline_text = item.deadline_text
+            for i in range(1, 6):
+                if not getattr(detail, f"topic_{i}"):
+                    setattr(detail, f"topic_{i}", getattr(item, f"topic_{i}"))
+            details.append(detail)
+        await context.close()
+        await browser.close()
+
+    summary_df, detail_df = dataframe_from_details(details)
+    summary_df = summary_df.drop_duplicates(subset=["detail_url"]).sort_values(by=["deadline_date", "title"], na_position="last")
+    detail_df = detail_df.drop_duplicates(subset=["detail_url"]).sort_values(by=["deadline_date", "title"], na_position="last")
+
+    changes_summary, new_df, updated_df, removed_df = build_delta(summary_df)
+
+    output_path = Path(OUTPUT_XLSX)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_df.to_excel(writer, sheet_name="grants_summary", index=False)
         detail_df.to_excel(writer, sheet_name="grants_detail", index=False)
@@ -688,40 +604,27 @@ def write_outputs(details: List[GrantDetail], output_path: Path, delta_output_pa
         new_df.to_excel(writer, sheet_name="weekly_new_plans", index=False)
         updated_df.to_excel(writer, sheet_name="weekly_updated_plans", index=False)
         removed_df.to_excel(writer, sheet_name="weekly_removed_plans", index=False)
-    style_workbook(output_path)
+    style_workbook(output_path, "grants_summary", "grants_detail")
 
-    with pd.ExcelWriter(delta_output_path, engine="openpyxl") as writer:
+    delta_path = Path(DELTA_XLSX)
+    with pd.ExcelWriter(delta_path, engine="openpyxl") as writer:
         changes_summary.to_excel(writer, sheet_name="changes_summary", index=False)
         new_df.to_excel(writer, sheet_name="new_plans", index=False)
         updated_df.to_excel(writer, sheet_name="updated_plans", index=False)
         removed_df.to_excel(writer, sheet_name="removed_plans", index=False)
-    style_workbook(delta_output_path)
+    style_workbook(delta_path, "new_plans", "updated_plans")
 
-    return {
-        "current_count": len(summary_df),
-        "new_count": len(new_df),
-        "updated_count": len(updated_df),
-        "removed_count": len(removed_df),
-    }
+    shutil.copyfile(output_path, PREVIOUS_SNAPSHOT)
 
-
-async def async_main(output_path: Path, delta_output_path: Path, previous_xlsx: Optional[Path]) -> Dict[str, int]:
-    crawler = GrantCrawler()
-    details = await crawler.run()
-    stats = write_outputs(details, output_path, delta_output_path, previous_xlsx)
-    logger.info("Exported %d records to %s", stats["current_count"], output_path)
-    logger.info("Delta workbook written to %s", delta_output_path)
-    return stats
-
-
-def main() -> None:
-    output_path = Path(os.getenv("OUTPUT_XLSX", "daysee_grants.xlsx"))
-    delta_output_path = Path(os.getenv("DELTA_XLSX", "daysee_grants_delta_only.xlsx"))
-    previous = os.getenv("PREVIOUS_XLSX")
-    previous_xlsx = Path(previous) if previous else None
-    stats = asyncio.run(async_main(output_path, delta_output_path, previous_xlsx))
-    print(json.dumps(stats, ensure_ascii=False))
+    logger.info("Exported %d grants to %s", len(summary_df), output_path)
+    logger.info("Exported delta workbook to %s", delta_path)
+    logger.info("Stats: %s", json.dumps({
+        "current_count": int(len(summary_df)),
+        "new_count": int(len(new_df)),
+        "updated_count": int(len(updated_df)),
+        "removed_count": int(len(removed_df)),
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
