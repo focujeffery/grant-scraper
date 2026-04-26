@@ -216,6 +216,13 @@ def split_lines(text: str) -> List[str]:
     return [clean_text(x) for x in re.split(r"[\r\n]+", text) if clean_text(x)]
 
 
+
+
+def normalize_label_line(line: str) -> str:
+    line = clean_text(line)
+    line = line.lstrip("*•·- ").strip()
+    line = re.sub(r"\s*[:：]\s*", "：", line)
+    return line
 def get_domain(url: str) -> str:
     if not url:
         return ""
@@ -306,10 +313,12 @@ def save_cache(cache: Dict[str, Dict[str, Any]]) -> None:
 # -------------------------
 # Daysee parsing
 # -------------------------
+
 def extract_after_label(lines: Sequence[str], start_label: str, stop_labels: Sequence[str]) -> List[str]:
     capture = False
     out: List[str] = []
-    for line in lines:
+    for raw_line in lines:
+        line = normalize_label_line(raw_line)
         if line.startswith(start_label):
             capture = True
             tail = clean_text(line.replace(start_label, "", 1))
@@ -319,8 +328,9 @@ def extract_after_label(lines: Sequence[str], start_label: str, stop_labels: Seq
         if capture and any(line.startswith(x) for x in stop_labels):
             break
         if capture and line:
+            if "你可能也會喜歡" in line or line.startswith("補助金額："):
+                break
             out.append(line)
-    # de-dup, preserve order
     seen = set()
     uniq = []
     for x in out:
@@ -338,43 +348,71 @@ def parse_total_results(html: str) -> int:
     return 0
 
 
+
 def parse_listing_page(html: str, seen_urls: set[str]) -> List[ListingItem]:
     soup = BeautifulSoup(html, "html.parser")
-    results: List[ListingItem] = []
+    lines = split_lines(soup.get_text("\n", strip=True))
+
+    # title links in visible order
+    title_links: List[Tuple[str, str]] = []
     for a in soup.select('a[href*="/subsidy/grant-"]'):
         href = urljoin(BASE_URL, a.get("href", "").strip())
+        title = clean_text(a.get_text(" ", strip=True))
+        if href and title:
+            title_links.append((title, href))
+
+    results: List[ListingItem] = []
+    cursor = 0
+    for idx, (title, href) in enumerate(title_links):
         if not href or href in seen_urls:
             continue
-        title = clean_text(a.get_text(" ", strip=True))
-        if not title:
+
+        title_idx = -1
+        for i in range(cursor, len(lines)):
+            if clean_text(lines[i]) == title:
+                title_idx = i
+                break
+        if title_idx == -1:
             continue
-        block = a
-        for _ in range(8):
-            txt = block.get_text("\n", strip=True) if hasattr(block, "get_text") else ""
-            if "截止日期" in txt and ("計畫來源" in txt or "補助對象" in txt):
+
+        next_title_idx = len(lines)
+        if idx + 1 < len(title_links):
+            next_title = title_links[idx + 1][0]
+            for j in range(title_idx + 1, len(lines)):
+                if clean_text(lines[j]) == next_title:
+                    next_title_idx = j
+                    break
+
+        card_lines = lines[title_idx:next_title_idx]
+        prev_lines = lines[max(0, title_idx - 5):title_idx]
+
+        grant_amount = ""
+        for prev in reversed(prev_lines):
+            prev = normalize_label_line(prev)
+            if prev.startswith("補助金額："):
+                grant_amount = clean_text(prev.replace("補助金額：", "", 1))
                 break
-            if getattr(block, "parent", None) is None:
-                break
-            block = block.parent
-        lines = split_lines(block.get_text("\n", strip=True))
-        topics = extract_after_label(lines, "＃關注議題：", ["＃補助對象：", "＃計畫來源：", "＃補助金額：", "截止日期："])
-        recipients = extract_after_label(lines, "＃補助對象：", ["＃計畫來源：", "＃補助金額：", "截止日期："])
-        sources = extract_after_label(lines, "＃計畫來源：", ["＃補助金額：", "截止日期："])
-        amounts = extract_after_label(lines, "＃補助金額：", ["截止日期："])
+
+        topics = extract_after_label(card_lines, "＃關注議題：", ["＃補助對象：", "＃計畫來源：", "＃補助金額：", "截止日期："])
+        recipients = extract_after_label(card_lines, "＃補助對象：", ["＃計畫來源：", "＃補助金額：", "截止日期："])
+        sources = extract_after_label(card_lines, "＃計畫來源：", ["＃補助金額：", "截止日期："])
+
         deadline_date = ""
-        for line in lines:
-            if line.startswith("截止日期："):
-                m = re.search(r"(\d{4}-\d{2}-\d{2})", line)
+        for line in card_lines:
+            line_n = normalize_label_line(line)
+            if line_n.startswith("截止日期："):
+                m = re.search(r"(\d{4}-\d{2}-\d{2})", line_n)
                 if m:
                     deadline_date = m.group(1)
                 break
+
         item = ListingItem(
             title=title,
             detail_url=href,
             plan_source="｜".join(sources),
             eligible_targets="｜".join(recipients),
             applicable_region="",
-            grant_amount="｜".join([x for x in amounts if not x.isdigit()]),
+            grant_amount=grant_amount,
             deadline_date=deadline_date,
             deadline_text="",
             topic_1=topics[0] if len(topics) > 0 else "",
@@ -385,6 +423,8 @@ def parse_listing_page(html: str, seen_urls: set[str]) -> List[ListingItem]:
         )
         results.append(item)
         seen_urls.add(href)
+        cursor = title_idx + 1
+
     return results
 
 
@@ -394,6 +434,7 @@ def find_google_search_link(soup: BeautifulSoup) -> str:
         if is_google_search_url(href):
             return href
     return ""
+
 
 
 def parse_detail_page(html: str, detail_url: str) -> DetailItem:
@@ -407,23 +448,34 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
         if node and clean_text(node.get_text(" ", strip=True)):
             title = clean_text(node.get_text(" ", strip=True))
             break
-
     if title.endswith("｜小社區大事件"):
         title = clean_text(title.replace("｜小社區大事件", ""))
 
+    trunc_idx = len(lines)
+    for i, line in enumerate(lines):
+        if "你可能也會喜歡這些資訊" in line or "返回主頁" in line:
+            trunc_idx = i
+            break
+    core_lines = lines[:trunc_idx]
+
     def after(label: str, stops: Sequence[str]) -> List[str]:
-        return extract_after_label(lines, label, stops)
+        return extract_after_label(core_lines, label, stops)
 
     plan_source = "｜".join(after("計畫來源：", ["補助對象：", "適用地區：", "補助金額：", "截止日期：", "關注議題："]))
     eligible_targets = "｜".join(after("補助對象：", ["適用地區：", "補助金額：", "截止日期：", "關注議題："]))
     applicable_region = "｜".join(after("適用地區：", ["補助金額：", "截止日期：", "關注議題："]))
-    grant_amount = "｜".join(after("補助金額：", ["截止日期：", "關注議題：", "申請文件：", "計畫背景："]))
+    amount_values = after("補助金額：", ["截止日期：", "關注議題：", "申請文件：", "計畫背景：", "計畫重點：", "撰寫技巧："])
+    grant_amount = "｜".join([
+        x for x in amount_values
+        if x and len(x) < 40 and "計畫" not in x and "關注議題" not in x and "補助對象" not in x and not x.isdigit()
+    ])
 
     deadline_date = ""
     deadline_text = ""
-    for line in lines:
-        if line.startswith("截止日期："):
-            payload = clean_text(line.replace("截止日期：", "", 1))
+    for line in core_lines:
+        line_n = normalize_label_line(line)
+        if line_n.startswith("截止日期："):
+            payload = clean_text(line_n.replace("截止日期：", "", 1))
             m = re.search(r"(\d{4}-\d{2}-\d{2})", payload)
             if m:
                 deadline_date = m.group(1)
@@ -433,10 +485,10 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
                 deadline_text = payload
             break
 
-    topics = after("關注議題：", ["申請文件：", "計畫背景：", "計畫重點：", "撰寫建議："])
-    plan_background = "\n".join(after("計畫背景：", ["計畫重點：", "撰寫建議：", "申請文件："]))
-    points = after("計畫重點：", ["撰寫建議：", "申請文件："])
-    tips = "\n".join(after("撰寫建議：", ["申請文件："]))
+    topics = after("關注議題：", ["申請文件：", "計畫背景：", "計畫重點：", "撰寫技巧："])
+    plan_background = "\n".join(after("計畫背景：", ["計畫重點：", "撰寫技巧：", "申請文件："]))
+    points = after("計畫重點：", ["撰寫技巧：", "申請文件："])
+    tips = "\n".join(after("撰寫技巧：", ["申請文件："]))
 
     direct_links: List[str] = []
     for a in soup.select("a[href]"):
@@ -476,9 +528,9 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
         key_point_4=points[3] if len(points) > 3 else "",
         key_point_5=points[4] if len(points) > 4 else "",
         application_tips=tips,
-        raw_text="\n".join(lines),
+        raw_text="\n".join(core_lines),
     )
-    # Prefer verified direct link from page if there is one.
+
     if direct_links:
         item.organizer_site_url = direct_links[0]
         item.organizer_site_domain = get_domain(direct_links[0])
@@ -490,117 +542,10 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
         else:
             item.official_url_status = "direct_non_google"
             item.official_url_confidence = "medium"
+
     return item
 
-
-# -------------------------
-# Search + verification layer
-# -------------------------
-def build_domain_hints(title: str, plan_source: str, region: str) -> List[str]:
-    domains: List[str] = []
-    for key, vals in CENTRAL_SOURCE_HINTS.items():
-        if key and key in plan_source:
-            domains.extend(vals)
-    haystack = " | ".join([title, plan_source, region])
-    for key, vals in LOCAL_GOV_HINTS.items():
-        if key and key in haystack:
-            domains.extend(vals)
-    if "縣市政府" in plan_source and not domains:
-        for key, vals in LOCAL_GOV_HINTS.items():
-            if key in title:
-                domains.extend(vals)
-    # de-dup preserve order
-    seen = set()
-    out = []
-    for d in domains:
-        if d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
-
-
-def search_bing_html(query: str) -> List[str]:
-    url = f"https://www.bing.com/search?q={quote_plus(query)}&setlang=zh-Hant"
-    resp = safe_request("GET", url)
-    if not resp or resp.status_code != 200:
-        return []
-    soup = BeautifulSoup(resp.text, "html.parser")
-    urls: List[str] = []
-    for a in soup.select("li.b_algo h2 a[href], a[href]"):
-        href = a.get("href", "").strip()
-        if not href.startswith("http"):
-            continue
-        d = get_domain(href)
-        if d in SEARCH_EXCLUDE_DOMAINS:
-            continue
-        if href not in urls:
-            urls.append(href)
-    return urls[:10]
-
-
-def search_ddg_html(query: str) -> List[str]:
-    url = "https://html.duckduckgo.com/html/"
-    resp = safe_request("POST", url, data={"q": query})
-    if not resp or resp.status_code != 200:
-        return []
-    soup = BeautifulSoup(resp.text, "html.parser")
-    urls: List[str] = []
-    for a in soup.select("a.result__a[href], a[href]"):
-        href = a.get("href", "").strip()
-        if not href.startswith("http"):
-            continue
-        d = get_domain(href)
-        if d in SEARCH_EXCLUDE_DOMAINS:
-            continue
-        if href not in urls:
-            urls.append(href)
-    return urls[:10]
-
-
-def verify_candidate(url: str, title: str, allowed_domains: Sequence[str]) -> Tuple[bool, str, float]:
-    if not url:
-        return False, "", 0.0
-    domain = get_domain(url)
-    if domain in SEARCH_EXCLUDE_DOMAINS:
-        return False, domain, 0.0
-
-    # Try variants to fix missing www issues.
-    variants = [url]
-    parsed = urlparse(url)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        host = parsed.netloc
-        if host.startswith("www."):
-            variants.append(url.replace("//www.", "//", 1))
-        else:
-            variants.append(url.replace(f"//{host}", f"//www.{host}", 1))
-
-    best_score = -1.0
-    best_url = ""
-    for variant in variants:
-        resp = safe_request("GET", variant, stream=False)
-        if not resp or resp.status_code >= 400:
-            continue
-        final_url = resp.url
-        final_domain = get_domain(final_url)
-        content = resp.text[:120000]
-        page_title = ""
-        m = re.search(r"<title[^>]*>(.*?)</title>", content, re.I | re.S)
-        if m:
-            page_title = clean_text(BeautifulSoup(m.group(1), "html.parser").get_text(" ", strip=True))
-        text_probe = f"{page_title}\n{BeautifulSoup(content, 'html.parser').get_text(' ', strip=True)[:8000]}"
-        overlap = keyword_overlap_score(title, text_probe)
-        gov_bonus = 0.35 if is_probably_government_domain(final_domain) else 0.0
-        allowed_bonus = 0.35 if any(final_domain.endswith(x) or final_domain == x for x in allowed_domains) else 0.0
-        path_bonus = 0.1 if re.search(r"(grant|subsid|news|bulletin|download|gov|plan|activity|article|content)", final_url, re.I) else 0.0
-        score = overlap + gov_bonus + allowed_bonus + path_bonus
-        if score > best_score:
-            best_score = score
-            best_url = final_url
-    return best_score >= 0.55, get_domain(best_url), best_score if best_score > 0 else 0.0
-
-
 def resolve_by_title(item: DetailItem, cache: Dict[str, Dict[str, Any]]) -> DetailItem:
-    # Keep trustworthy direct links.
     if item.official_url_status in {"direct_official", "direct_non_google"}:
         return item
 
@@ -619,23 +564,26 @@ def resolve_by_title(item: DetailItem, cache: Dict[str, Dict[str, Any]]) -> Deta
 
     norm = normalize_title(item.title)
     hints = build_domain_hints(item.title, item.plan_source, item.applicable_region)
+    raw_query = extract_google_query(item.organizer_site_url_raw) if is_google_search_url(item.organizer_site_url_raw) else ""
 
-    queries: List[Tuple[str, str]] = []  # (query, scope)
+    queries: List[Tuple[str, str]] = []
+    base_terms = [x for x in [raw_query, norm["full"], norm["core"]] if x]
+    base_terms = list(dict.fromkeys(base_terms))
+
     if hints:
-        for d in hints[:4]:
-            queries.append((f'"{norm["full"]}" site:{d}', d))
-            if norm["core"] != norm["full"]:
-                queries.append((f'"{norm["core"]}" site:{d}', d))
+        for d in hints[:5]:
+            for term in base_terms[:3]:
+                queries.append((f'"{term}" site:{d}', d))
             queries.append((f'"{norm["core"]}" 補助 site:{d}', d))
             queries.append((f'"{norm["core"]}" 公告 site:{d}', d))
+            queries.append((f'"{norm["core"]}" 申請 site:{d}', d))
     else:
-        queries.append((norm["full"], ""))
-        if norm["core"] != norm["full"]:
-            queries.append((norm["core"], ""))
+        for term in base_terms[:3]:
+            queries.append((term, ""))
 
     candidates: List[CandidateURL] = []
     seen_urls = set()
-    for query, scope in queries[:8]:
+    for query, scope in queries[:14]:
         item.organizer_search_query = query
         item.organizer_search_scope = scope
         urls = search_bing_html(query)
@@ -646,11 +594,11 @@ def resolve_by_title(item: DetailItem, cache: Dict[str, Dict[str, Any]]) -> Deta
                 continue
             seen_urls.add(u)
             candidates.append(CandidateURL(url=u, source="search", scope=scope, query=query))
-        if len(candidates) >= 12:
+        if len(candidates) >= 16:
             break
-        time.sleep(0.3)
+        time.sleep(0.2)
 
-    best_verified: Optional[Tuple[str, str, float, str, str]] = None  # url, domain, score, query, scope
+    best_verified: Optional[Tuple[str, str, float, str, str]] = None
     for cand in candidates:
         ok, domain, score = verify_candidate(cand.url, item.title, hints)
         if ok:
@@ -683,350 +631,10 @@ def resolve_by_title(item: DetailItem, cache: Dict[str, Dict[str, Any]]) -> Deta
         }
         return item
 
-    # Last resort: keep original search URL if present; do not invent portals.
-    raw = item.organizer_site_url_raw
-    if raw:
-        item.organizer_site_url = raw
-        item.organizer_site_domain = get_domain(raw)
+    if item.organizer_site_url_raw:
+        item.organizer_site_url = item.organizer_site_url_raw
+        item.organizer_site_domain = get_domain(item.organizer_site_url_raw)
     item.official_url_status = "search_no_match"
     item.official_url_confidence = "low"
     return item
 
-
-def listing_fallback(item: ListingItem) -> DetailItem:
-    return DetailItem(
-        title=item.title,
-        detail_url=str(item.detail_url),
-        plan_source=item.plan_source,
-        eligible_targets=item.eligible_targets,
-        applicable_region=item.applicable_region,
-        grant_amount=item.grant_amount,
-        deadline_date=item.deadline_date,
-        deadline_text=item.deadline_text,
-        topic_1=item.topic_1,
-        topic_2=item.topic_2,
-        topic_3=item.topic_3,
-        topic_4=item.topic_4,
-        topic_5=item.topic_5,
-        official_url_status="detail_timeout_fallback",
-        official_url_confidence="low",
-    )
-
-
-async def extract_detail(page, item: ListingItem) -> DetailItem:
-    detail_url = str(item.detail_url)
-    logger.info("Fetching detail: %s", detail_url)
-    last_exc = None
-    for attempt in range(1, 4):
-        try:
-            await page.goto(detail_url, wait_until="domcontentloaded", timeout=90000)
-            await page.wait_for_timeout(1500)
-            html = await page.content()
-            return parse_detail_page(html, detail_url)
-        except PlaywrightTimeoutError as exc:
-            last_exc = exc
-            logger.warning("Detail timeout for %s (attempt %d/3)", detail_url, attempt)
-            try:
-                await page.goto("about:blank", wait_until="load", timeout=10000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1200 * attempt)
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Detail fetch failed for %s (attempt %d/3): %s", detail_url, attempt, exc)
-            try:
-                await page.goto("about:blank", wait_until="load", timeout=10000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(1200 * attempt)
-    logger.error("Fallback to listing-only detail for %s because detail page could not be read: %s", detail_url, last_exc)
-    return listing_fallback(item)
-
-
-async def extract_all_listings(page) -> List[ListingItem]:
-    await page.goto(LISTING_URL, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
-
-    seen_urls: set[str] = set()
-    all_items: List[ListingItem] = []
-    target_total = 0
-    stagnation = 0
-
-    for page_no in range(1, MAX_PAGES + 1):
-        logger.info("Scanning listing page %d", page_no)
-        html = await page.content()
-        if not target_total:
-            target_total = parse_total_results(html)
-            if target_total:
-                logger.info("Target total grants detected: %d", target_total)
-
-        before = len(seen_urls)
-        items = parse_listing_page(html, seen_urls)
-        if items:
-            all_items.extend(items)
-        after = len(seen_urls)
-        logger.info("Collected so far: %d", after)
-
-        if target_total and after >= target_total:
-            logger.info("Reached target total %d. Stop pagination.", target_total)
-            break
-
-        # Find a next button.
-        next_button = None
-        for sel in ["a.ts-load-next:not(.ts-btn-disabled)", "text=下一頁"]:
-            try:
-                locator = page.locator(sel)
-                if await locator.count() > 0:
-                    next_button = locator.last
-                    break
-            except Exception:
-                continue
-        if next_button is None:
-            logger.info("No usable next button found; stop pagination.")
-            break
-
-        # Click + poll until we truly see new items.
-        progress = False
-        for click_attempt in range(1, 4):
-            try:
-                await next_button.scroll_into_view_if_needed(timeout=1500)
-            except Exception:
-                pass
-            try:
-                await next_button.click(force=True, timeout=4000)
-            except Exception:
-                handle = await next_button.element_handle()
-                if handle:
-                    await page.evaluate("(el) => el.click()", handle)
-            for _ in range(6):
-                await page.wait_for_timeout(800)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=3000)
-                except Exception:
-                    pass
-                probe_html = await page.content()
-                probe_seen = set(seen_urls)
-                parse_listing_page(probe_html, probe_seen)
-                if len(probe_seen) > after:
-                    progress = True
-                    break
-            if progress:
-                stagnation = 0
-                break
-            logger.info("Pagination did not advance after click (%d/3)", click_attempt)
-
-        if not progress:
-            stagnation += 1
-            if stagnation >= 2:
-                logger.info("Stop pagination because there is no further progress.")
-                break
-        else:
-            await page.wait_for_timeout(1200)
-
-    return all_items
-
-
-# -------------------------
-# Delta generation
-# -------------------------
-def row_signature(row: pd.Series, cols: Sequence[str]) -> str:
-    payload = "||".join(str(row.get(c, "") or "") for c in cols)
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
-
-
-def build_delta(current_df: pd.DataFrame, previous_df: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, int]]:
-    key = "detail_url"
-    compare_cols = [
-        "title", "plan_source", "eligible_targets", "applicable_region", "grant_amount",
-        "deadline_date", "deadline_text", "organizer_site_url", "official_organizer_site_url",
-        "official_url_status",
-    ]
-
-    if previous_df is None or previous_df.empty or key not in previous_df.columns:
-        new_df = current_df.copy()
-        updated_df = current_df.iloc[0:0].copy()
-        removed_df = current_df.iloc[0:0].copy()
-        stats = {
-            "current_count": int(len(current_df)),
-            "previous_count": 0,
-            "new_count": int(len(new_df)),
-            "updated_count": 0,
-            "removed_count": 0,
-        }
-        return new_df, updated_df, removed_df, stats
-
-    curr = current_df.copy()
-    prev = previous_df.copy()
-    curr["__sig__"] = curr.apply(lambda r: row_signature(r, compare_cols), axis=1)
-    prev["__sig__"] = prev.apply(lambda r: row_signature(r, compare_cols), axis=1)
-
-    curr_map = curr.set_index(key)["__sig__"].to_dict()
-    prev_map = prev.set_index(key)["__sig__"].to_dict()
-
-    new_keys = [k for k in curr_map.keys() if k not in prev_map]
-    removed_keys = [k for k in prev_map.keys() if k not in curr_map]
-    updated_keys = [k for k in curr_map.keys() if k in prev_map and curr_map[k] != prev_map[k]]
-
-    new_df = curr[curr[key].isin(new_keys)].drop(columns=["__sig__"], errors="ignore")
-    updated_df = curr[curr[key].isin(updated_keys)].drop(columns=["__sig__"], errors="ignore")
-    removed_df = prev[prev[key].isin(removed_keys)].drop(columns=["__sig__"], errors="ignore")
-    stats = {
-        "current_count": int(len(curr)),
-        "previous_count": int(len(prev)),
-        "new_count": int(len(new_df)),
-        "updated_count": int(len(updated_df)),
-        "removed_count": int(len(removed_df)),
-    }
-    return new_df, updated_df, removed_df, stats
-
-
-# -------------------------
-# Excel formatting
-# -------------------------
-def auto_fit_worksheet(ws, wrap_cols: Sequence[str] = ()):
-    headers = [c.value for c in ws[1]]
-    header_index = {h: i + 1 for i, h in enumerate(headers)}
-    for i, header in enumerate(headers, start=1):
-        max_len = len(str(header or ""))
-        for row in ws.iter_rows(min_row=2, max_col=i, min_col=i):
-            val = row[0].value
-            if val is None:
-                continue
-            l = min(len(str(val)), 80)
-            if l > max_len:
-                max_len = l
-        width = min(max(max_len + 2, 12), 45)
-        ws.column_dimensions[get_column_letter(i)].width = width
-        alignment = Alignment(vertical="top", wrap_text=header in wrap_cols)
-        for cell in ws[get_column_letter(i)]:
-            cell.alignment = alignment
-    ws.freeze_panes = "A2"
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-
-def _item_to_row(x: Any) -> Dict[str, Any]:
-    if hasattr(x, "model_dump"):
-        return x.model_dump()
-    if hasattr(x, "dict"):
-        return x.dict()
-    if is_dataclass(x):
-        return asdict(x)
-    if isinstance(x, dict):
-        return dict(x)
-    raise TypeError(f"Unsupported item type for workbook export: {type(x)!r}")
-
-
-def write_workbooks(detail_items: List[DetailItem], previous_df: Optional[pd.DataFrame]) -> Dict[str, int]:
-    rows = [_item_to_row(x) for x in detail_items]
-    detail_df = pd.DataFrame(rows)
-
-    summary_cols = [
-        "title", "detail_url", "plan_source", "eligible_targets", "applicable_region",
-        "grant_amount", "deadline_date", "deadline_text",
-        "topic_1", "topic_2", "topic_3", "topic_4", "topic_5",
-        "organizer_site_url", "organizer_site_domain",
-        "official_organizer_site_url", "official_organizer_domain",
-        "official_url_status", "official_url_confidence",
-    ]
-    for c in summary_cols:
-        if c not in detail_df.columns:
-            detail_df[c] = ""
-    summary_df = detail_df[summary_cols].copy()
-
-    new_df, updated_df, removed_df, stats = build_delta(summary_df, previous_df)
-
-    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="grants_summary", index=False)
-        detail_df.to_excel(writer, sheet_name="grants_detail", index=False)
-        pd.DataFrame([stats]).to_excel(writer, sheet_name="weekly_changes_summary", index=False)
-        new_df.to_excel(writer, sheet_name="weekly_new_plans", index=False)
-        updated_df.to_excel(writer, sheet_name="weekly_updated_plans", index=False)
-        removed_df.to_excel(writer, sheet_name="weekly_removed_plans", index=False)
-
-    wb = load_workbook(OUTPUT_XLSX)
-    auto_fit_worksheet(wb["grants_summary"], wrap_cols=[])
-    auto_fit_worksheet(wb["grants_detail"], wrap_cols=["plan_background", "application_tips", "raw_text", "organizer_site_note"])
-    auto_fit_worksheet(wb["weekly_new_plans"], wrap_cols=[])
-    auto_fit_worksheet(wb["weekly_updated_plans"], wrap_cols=[])
-    auto_fit_worksheet(wb["weekly_removed_plans"], wrap_cols=[])
-    wb.save(OUTPUT_XLSX)
-
-    with pd.ExcelWriter(DELTA_XLSX, engine="openpyxl") as writer:
-        pd.DataFrame([stats]).to_excel(writer, sheet_name="changes_summary", index=False)
-        new_df.to_excel(writer, sheet_name="new_plans", index=False)
-        updated_df.to_excel(writer, sheet_name="updated_plans", index=False)
-        removed_df.to_excel(writer, sheet_name="removed_plans", index=False)
-
-    wb2 = load_workbook(DELTA_XLSX)
-    auto_fit_worksheet(wb2["changes_summary"], wrap_cols=[])
-    auto_fit_worksheet(wb2["new_plans"], wrap_cols=[])
-    auto_fit_worksheet(wb2["updated_plans"], wrap_cols=[])
-    auto_fit_worksheet(wb2["removed_plans"], wrap_cols=[])
-    wb2.save(DELTA_XLSX)
-    return stats
-
-
-def load_previous_summary() -> Optional[pd.DataFrame]:
-    if not Path(PREVIOUS_XLSX).exists():
-        return None
-    try:
-        return pd.read_excel(PREVIOUS_XLSX, sheet_name="grants_summary")
-    except Exception:
-        try:
-            return pd.read_excel(PREVIOUS_XLSX)
-        except Exception:
-            return None
-
-
-# -------------------------
-# Main
-# -------------------------
-async def main() -> None:
-    cache = load_cache()
-    previous_df = load_previous_summary()
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=UA, locale="zh-TW")
-        list_page = await context.new_page()
-        listing_items = await extract_all_listings(list_page)
-        await list_page.close()
-        logger.info("Found %d grants", len(listing_items))
-
-        detail_page = await context.new_page()
-        detail_items: List[DetailItem] = []
-        for item in listing_items:
-            detail = await extract_detail(detail_page, item)
-            detail = resolve_by_title(detail, cache)
-            # If detail lacked some listing values, backfill from listing.
-            if not detail.plan_source:
-                detail.plan_source = item.plan_source
-            if not detail.eligible_targets:
-                detail.eligible_targets = item.eligible_targets
-            if not detail.grant_amount:
-                detail.grant_amount = item.grant_amount
-            if not detail.deadline_date:
-                detail.deadline_date = item.deadline_date
-            if not detail.topic_1:
-                detail.topic_1 = item.topic_1
-                detail.topic_2 = item.topic_2
-                detail.topic_3 = item.topic_3
-                detail.topic_4 = item.topic_4
-                detail.topic_5 = item.topic_5
-            detail_items.append(detail)
-            await asyncio.sleep(0.3)
-        await detail_page.close()
-        await context.close()
-        await browser.close()
-
-    stats = write_workbooks(detail_items, previous_df)
-    save_cache(cache)
-    logger.info("Exported %d records to %s", len(detail_items), OUTPUT_XLSX)
-    print(json.dumps(stats, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
