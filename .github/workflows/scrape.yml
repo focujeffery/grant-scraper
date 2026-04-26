@@ -16,7 +16,7 @@ concurrency:
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 210
 
     steps:
       - name: Checkout repository
@@ -58,16 +58,6 @@ jobs:
           fi
           set -o pipefail
           python grant_scraper.py | tee outputs/run.log
-          echo "=== CURRENT DIR ==="
-          pwd
-          echo "=== FILES IN ROOT ==="
-          ls -la .
-          echo "=== FILES IN OUTPUTS ==="
-          ls -la outputs || true
-          echo "=== FILES IN STATE ==="
-          ls -la state || true
-          echo "=== FIND XLSX ==="
-          find . -maxdepth 3 -name "*.xlsx" -print
           test -f outputs/daysee_grants.xlsx
 
       - name: Resolve missing official URLs
@@ -76,6 +66,9 @@ jobs:
           DELTA_XLSX: outputs/daysee_grants_delta_only.xlsx
           CACHE_JSON: state/title_url_cache.json
           MAX_MISSING: "0"
+          MAX_RUNTIME_SECONDS: "1500"
+          VERIFY_TIMEOUT: "10"
+          SEARCH_TIMEOUT: "15"
         run: |
           python resolve_missing_urls.py
           test -f outputs/daysee_grants.xlsx
