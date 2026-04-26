@@ -313,7 +313,6 @@ def save_cache(cache: Dict[str, Dict[str, Any]]) -> None:
 # -------------------------
 # Daysee parsing
 # -------------------------
-
 def extract_after_label(lines: Sequence[str], start_label: str, stop_labels: Sequence[str]) -> List[str]:
     capture = False
     out: List[str] = []
@@ -348,12 +347,10 @@ def parse_total_results(html: str) -> int:
     return 0
 
 
-
 def parse_listing_page(html: str, seen_urls: set[str]) -> List[ListingItem]:
     soup = BeautifulSoup(html, "html.parser")
     lines = split_lines(soup.get_text("\n", strip=True))
 
-    # title links in visible order
     title_links: List[Tuple[str, str]] = []
     for a in soup.select('a[href*="/subsidy/grant-"]'):
         href = urljoin(BASE_URL, a.get("href", "").strip())
@@ -388,9 +385,9 @@ def parse_listing_page(html: str, seen_urls: set[str]) -> List[ListingItem]:
 
         grant_amount = ""
         for prev in reversed(prev_lines):
-            prev = normalize_label_line(prev)
-            if prev.startswith("補助金額："):
-                grant_amount = clean_text(prev.replace("補助金額：", "", 1))
+            prev_n = normalize_label_line(prev)
+            if prev_n.startswith("補助金額："):
+                grant_amount = clean_text(prev_n.replace("補助金額：", "", 1))
                 break
 
         topics = extract_after_label(card_lines, "＃關注議題：", ["＃補助對象：", "＃計畫來源：", "＃補助金額：", "截止日期："])
@@ -426,17 +423,6 @@ def parse_listing_page(html: str, seen_urls: set[str]) -> List[ListingItem]:
         cursor = title_idx + 1
 
     return results
-
-
-def find_google_search_link(soup: BeautifulSoup) -> str:
-    for a in soup.select("a[href]"):
-        href = a.get("href", "").strip()
-        if is_google_search_url(href):
-            return href
-    return ""
-
-
-
 def parse_detail_page(html: str, detail_url: str) -> DetailItem:
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text("\n", strip=True)
@@ -544,7 +530,6 @@ def parse_detail_page(html: str, detail_url: str) -> DetailItem:
             item.official_url_confidence = "medium"
 
     return item
-
 def resolve_by_title(item: DetailItem, cache: Dict[str, Dict[str, Any]]) -> DetailItem:
     if item.official_url_status in {"direct_official", "direct_non_google"}:
         return item
