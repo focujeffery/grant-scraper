@@ -907,21 +907,20 @@ def auto_fit_worksheet(ws, wrap_cols: Sequence[str] = ()):
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
-def _rowify(item: Any) -> Dict[str, Any]:
-    if isinstance(item, dict):
-        return dict(item)
-    if hasattr(item, "model_dump"):
-        return item.model_dump()
-    if hasattr(item, "dict"):
-        return item.dict()
-    try:
-        return asdict(item)
-    except Exception:
-        raise TypeError(f"Unsupported row type for workbook export: {type(item)!r}")
+def _item_to_row(x: Any) -> Dict[str, Any]:
+    if hasattr(x, "model_dump"):
+        return x.model_dump()
+    if hasattr(x, "dict"):
+        return x.dict()
+    if is_dataclass(x):
+        return asdict(x)
+    if isinstance(x, dict):
+        return dict(x)
+    raise TypeError(f"Unsupported item type for workbook export: {type(x)!r}")
 
 
 def write_workbooks(detail_items: List[DetailItem], previous_df: Optional[pd.DataFrame]) -> Dict[str, int]:
-    rows = [_rowify(x) for x in detail_items]
+    rows = [_item_to_row(x) for x in detail_items]
     detail_df = pd.DataFrame(rows)
 
     summary_cols = [
