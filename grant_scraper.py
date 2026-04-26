@@ -735,6 +735,14 @@ def load_previous_summary() -> Optional[pd.DataFrame]:
         return None
 
 
+def normalize_compare_value(v: Any) -> str:
+    if pd.isna(v):
+        return ""
+    s = str(v).strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
 def build_delta(current_df: pd.DataFrame, previous_df: Optional[pd.DataFrame]):
     key_col = "detail_url"
     if previous_df is None or previous_df.empty:
@@ -755,10 +763,22 @@ def build_delta(current_df: pd.DataFrame, previous_df: Optional[pd.DataFrame]):
     new_keys = [k for k in cur_idx.index if k not in prev_idx.index]
     removed_keys = [k for k in prev_idx.index if k not in cur_idx.index]
 
-    compare_cols = [c for c in cur.columns if c in prev.columns and c != key_col]
+    stable_compare_cols = [
+        "title", "plan_source", "eligible_targets", "applicable_region",
+        "grant_amount", "deadline_date", "deadline_text",
+        "topic_1", "topic_2", "topic_3", "topic_4", "topic_5",
+        "organizer_site_url", "official_organizer_site_url", "official_organizer_domain",
+    ]
+    compare_cols = [c for c in stable_compare_cols if c in cur.columns and c in prev.columns]
+
     updated_keys = []
     for k in cur_idx.index.intersection(prev_idx.index):
-        if any(str(cur_idx.at[k, c]) != str(prev_idx.at[k, c]) for c in compare_cols):
+        changed = False
+        for c in compare_cols:
+            if normalize_compare_value(cur_idx.at[k, c]) != normalize_compare_value(prev_idx.at[k, c]):
+                changed = True
+                break
+        if changed:
             updated_keys.append(k)
 
     new_df = cur_idx.loc[new_keys].reset_index(drop=True) if new_keys else cur.iloc[0:0].copy()
@@ -855,12 +875,13 @@ async def async_main() -> None:
         list_page = await context.new_page()
         listing_items = await extract_all_listings(list_page)
         await list_page.close()
-        logger.info("Found %d grants", len(listing_items))
+        logger.info("Found %d grants in stage 1 listing/detail crawl", len(listing_items))
 
         detail_page = await context.new_page()
         detail_items: List[DetailItem] = []
         for item in listing_items:
             detail = await extract_detail(detail_page, item)
+            # Stage 2: title-driven official URL resolver (isolated from primary crawl)
             detail = resolve_by_title(detail, cache)
             if not detail.plan_source:
                 detail.plan_source = item.plan_source
