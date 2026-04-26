@@ -1,30 +1,6 @@
 #!/usr/bin/env python3
-"""
-resolve_missing_urls.py
-
-Independent second-stage resolver for daysee_grants.xlsx.
-
-Goal:
-- ONLY process rows where official_url_status == "search_no_match"
-- Use the FULL title string as the primary search key (do not split year/title)
-- Restrict candidate searches to likely government domains whenever possible
-- Verify candidate URLs before writing them back
-- Update grants_summary / grants_detail in the main workbook
-- Optionally update new_plans / updated_plans in the delta workbook
-- Cache verified results to avoid re-searching the same title every week
-
-Recommended usage in GitHub Actions after the main scraper:
-    python resolve_missing_urls.py
-
-Environment variables:
-    INPUT_XLSX   (default: outputs/daysee_grants.xlsx)
-    DELTA_XLSX   (default: outputs/daysee_grants_delta_only.xlsx)
-    CACHE_JSON   (default: state/title_url_cache.json)
-    MAX_MISSING  (default: 0 = all search_no_match rows)
-"""
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import os
 import re
@@ -32,7 +8,8 @@ import time
 import hashlib
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote_plus, urlparse, urlunparse
 
 import pandas as pd
@@ -42,7 +19,10 @@ from bs4 import BeautifulSoup
 INPUT_XLSX = os.getenv("INPUT_XLSX", "outputs/daysee_grants.xlsx")
 DELTA_XLSX = os.getenv("DELTA_XLSX", "outputs/daysee_grants_delta_only.xlsx")
 CACHE_JSON = os.getenv("CACHE_JSON", "state/title_url_cache.json")
-MAX_MISSING = int(os.getenv("MAX_MISSING", "0") or "0")
+MAX_MISSING = int(os.getenv("MAX_MISSING", "0") or "0")  # 0 = all rows
+MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "2400") or "2400")  # default 40 min
+VERIFY_TIMEOUT = int(os.getenv("VERIFY_TIMEOUT", "12") or "12")
+SEARCH_TIMEOUT = int(os.getenv("SEARCH_TIMEOUT", "18") or "18")
 
 HEADERS = {
     "User-Agent": (
@@ -57,10 +37,11 @@ BAD_DOMAINS = {
     "www.bing.com", "bing.com", "duckduckgo.com", "html.duckduckgo.com",
     "facebook.com", "www.facebook.com", "instagram.com", "www.instagram.com",
     "www.104.com.tw", "104.com.tw", "youtube.com", "www.youtube.com",
+    "www.dayseechat.com", "dayseechat.com",
 }
 
 CENTRAL_SOURCE_HINTS: Dict[str, List[str]] = {
-    "勞動部": ["mol.gov.tw", "wda.gov.tw", "wlb.mol.gov.tw"],
+    "勞動部": ["mol.gov.tw", "wlb.mol.gov.tw", "wda.gov.tw"],
     "教育部": ["moe.gov.tw"],
     "經濟部": ["moea.gov.tw", "sme.gov.tw", "www.sme.gov.tw"],
     "數位發展部": ["moda.gov.tw", "adi.gov.tw", "digiplus.adi.gov.tw"],
@@ -107,14 +88,8 @@ LOCAL_REGION_HINTS: Dict[str, List[str]] = {
     "馬祖": ["matsu.gov.tw", "www.matsu.gov.tw"],
 }
 
-PRIMARY_COMPARE_COLS = [
-    "title", "detail_url", "plan_source", "eligible_targets", "applicable_region",
-    "grant_amount", "deadline_date", "deadline_text",
-    "topic_1", "topic_2", "topic_3", "topic_4", "topic_5",
-    "organizer_site_url", "organizer_site_domain",
-    "official_organizer_site_url", "official_organizer_domain",
-    "official_url_status", "official_url_confidence",
-]
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 @dataclass
 class Candidate:
@@ -136,22 +111,19 @@ def normalize_text(s: Any) -> str:
     return s
 
 def normalize_title_key(title: str) -> str:
-    s = normalize_text(title).lower()
-    s = s.replace("臺", "台")
+    s = normalize_text(title).lower().replace("臺", "台")
     s = re.sub(r"[｜|／/()\[\]【】「」『』：:、，,。．.；;！!？?\-_\s]+", "", s)
     return s
 
-def sha1_short(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:12]
+def cache_key(title: str, source: str, region: str) -> str:
+    raw = "||".join([normalize_title_key(title), normalize_title_key(source), normalize_title_key(region)])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 def get_domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower()
     except Exception:
         return ""
-
-def is_google_search_url(url: str) -> bool:
-    return "google.com/search?" in (url or "")
 
 def is_probably_official_domain(domain: str) -> bool:
     domain = (domain or "").lower()
@@ -160,30 +132,24 @@ def is_probably_official_domain(domain: str) -> bool:
     return (
         domain.endswith(".gov.tw")
         or domain.endswith(".gov")
-        or domain in {
-            "gov.taipei", "www.gov.taipei",
-            "youthhsinchu.hccg.gov.tw",
-        }
+        or domain in {"gov.taipei", "www.gov.taipei", "youthhsinchu.hccg.gov.tw"}
     )
 
 def with_www_variants(url: str) -> List[str]:
     parsed = urlparse(url)
     host = parsed.netloc
-    variants = []
     if not host:
         return [url]
-    variants.append(url)
+    variants = [url]
     if host.startswith("www."):
         variants.append(urlunparse(parsed._replace(netloc=host[4:])))
     else:
         variants.append(urlunparse(parsed._replace(netloc="www." + host)))
-    # unique preserve order
-    out = []
-    seen = set()
+    out, seen = [], set()
     for v in variants:
         if v not in seen:
-            out.append(v)
             seen.add(v)
+            out.append(v)
     return out
 
 def region_hint_domains(title: str, region: str) -> List[str]:
@@ -192,13 +158,11 @@ def region_hint_domains(title: str, region: str) -> List[str]:
     for k, vals in LOCAL_REGION_HINTS.items():
         if k in text:
             domains.extend(vals)
-    # unique
-    out = []
-    seen = set()
+    out, seen = [], set()
     for d in domains:
         if d not in seen:
-            out.append(d)
             seen.add(d)
+            out.append(d)
     return out
 
 def source_hint_domains(plan_source: str) -> List[str]:
@@ -206,120 +170,104 @@ def source_hint_domains(plan_source: str) -> List[str]:
     for k, vals in CENTRAL_SOURCE_HINTS.items():
         if k in normalize_text(plan_source):
             domains.extend(vals)
-    out = []
-    seen = set()
+    out, seen = [], set()
     for d in domains:
         if d not in seen:
-            out.append(d)
             seen.add(d)
+            out.append(d)
     return out
 
-def build_scope_domains(title: str, plan_source: str, applicable_region: str) -> List[str]:
-    domains = []
-    domains.extend(region_hint_domains(title, applicable_region))
+def build_scope_domains(title: str, plan_source: str, region: str) -> List[str]:
+    domains: List[str] = []
+    domains.extend(region_hint_domains(title, region))
     domains.extend(source_hint_domains(plan_source))
     if not domains:
-        # If plan_source says 縣市政府 but region is missing, try infer from title.
         domains.extend(region_hint_domains(title, title))
-    # unique
-    out = []
-    seen = set()
+    out, seen = [], set()
     for d in domains:
         if d not in seen:
-            out.append(d)
             seen.add(d)
-    return out
+            out.append(d)
+    return out[:5]
 
-def build_queries(full_title: str, plan_source: str, applicable_region: str) -> List[Tuple[str, str]]:
+def build_queries(full_title: str, plan_source: str, region: str) -> List[Tuple[str, str]]:
     """
-    IMPORTANT:
-    Per user requirement, search MUST prioritize the FULL title.
-    We do not split year/title into a separate core-title search here.
+    Follow user requirement: use FULL title, do NOT split year/title.
+    Keep query count intentionally small for runtime stability.
     """
     full_title = normalize_text(full_title)
     plan_source = normalize_text(plan_source)
-    applicable_region = normalize_text(applicable_region)
-    scopes = build_scope_domains(full_title, plan_source, applicable_region)
+    region = normalize_text(region)
+    scopes = build_scope_domains(full_title, plan_source, region)
 
     queries: List[Tuple[str, str]] = []
     if scopes:
-        for d in scopes:
+        for d in scopes[:3]:
             queries.append((f'"{full_title}" site:{d}', d))
             if plan_source:
                 queries.append((f'"{full_title}" "{plan_source}" site:{d}', d))
-            if applicable_region and applicable_region not in {"不分縣市", "全國", "不分地區"}:
-                queries.append((f'"{full_title}" "{applicable_region}" site:{d}', d))
-            queries.append((f'"{full_title}" 補助 site:{d}', d))
-            queries.append((f'"{full_title}" 公告 site:{d}', d))
-            queries.append((f'"{full_title}" PDF site:{d}', d))
+            if region and region not in {"不分縣市", "全國", "不分地區"}:
+                queries.append((f'"{full_title}" "{region}" site:{d}', d))
     else:
-        # fallback only when no hint domain can be inferred
         queries.append((f'"{full_title}"', ""))
         if plan_source:
             queries.append((f'"{full_title}" "{plan_source}"', ""))
-        if applicable_region and applicable_region not in {"不分縣市", "全國", "不分地區"}:
-            queries.append((f'"{full_title}" "{applicable_region}"', ""))
+        if region and region not in {"不分縣市", "全國", "不分地區"}:
+            queries.append((f'"{full_title}" "{region}"', ""))
 
-    # unique preserve order
-    out = []
-    seen = set()
+    out, seen = [], set()
     for q, s in queries:
         key = (q, s)
         if key not in seen:
-            out.append((q, s))
             seen.add(key)
-    return out[:18]
+            out.append((q, s))
+    return out[:6]
 
 def extract_bing_urls(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     urls: List[str] = []
     for a in soup.select("li.b_algo h2 a[href], a[href]"):
         href = a.get("href", "").strip()
-        if not href:
+        if not href.startswith("http"):
             continue
         domain = get_domain(href)
         if domain in BAD_DOMAINS:
             continue
-        if href.startswith("http"):
-            urls.append(href)
-    # unique
-    out = []
-    seen = set()
+        urls.append(href)
+    out, seen = [], set()
     for u in urls:
         if u not in seen:
-            out.append(u)
             seen.add(u)
-    return out[:12]
+            out.append(u)
+    return out[:6]
 
 def extract_ddg_urls(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     urls: List[str] = []
     for a in soup.select("a.result__a[href], a[href]"):
         href = a.get("href", "").strip()
-        if not href:
+        if not href.startswith("http"):
             continue
         domain = get_domain(href)
         if domain in BAD_DOMAINS:
             continue
-        if href.startswith("http"):
-            urls.append(href)
-    out = []
-    seen = set()
+        urls.append(href)
+    out, seen = [], set()
     for u in urls:
         if u not in seen:
-            out.append(u)
             seen.add(u)
-    return out[:12]
+            out.append(u)
+    return out[:6]
 
 def search_bing(query: str) -> List[str]:
     url = "https://www.bing.com/search?q=" + quote_plus(query)
-    resp = requests.get(url, headers=HEADERS, timeout=25)
+    resp = SESSION.get(url, timeout=SEARCH_TIMEOUT)
     resp.raise_for_status()
     return extract_bing_urls(resp.text)
 
 def search_ddg(query: str) -> List[str]:
     url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-    resp = requests.get(url, headers=HEADERS, timeout=25)
+    resp = SESSION.get(url, timeout=SEARCH_TIMEOUT)
     resp.raise_for_status()
     return extract_ddg_urls(resp.text)
 
@@ -330,31 +278,22 @@ def title_match_score(full_title: str, text: str) -> float:
         return 0.0
     if full_title in text:
         return 1.0
-
     full_key = normalize_title_key(full_title)
     text_key = normalize_title_key(text)
     if full_key and full_key in text_key:
-        return 0.95
-
-    # token overlap, but keep full title as primary basis
-    tokens = [t for t in re.split(r"\s+", full_title) if t]
-    if not tokens:
-        return 0.0
-    hit = sum(1 for t in tokens if t in text)
-    return hit / max(len(tokens), 1)
+        return 0.96
+    return 0.0
 
 def verify_candidate(url: str, full_title: str, scope: str) -> Tuple[bool, str, float]:
-    """
-    Returns: (verified, final_domain, score)
-    """
     best_score = 0.0
     best_domain = get_domain(url)
 
     for candidate_url in with_www_variants(url):
         try:
-            resp = requests.get(candidate_url, headers=HEADERS, timeout=25, allow_redirects=True)
+            resp = SESSION.get(candidate_url, timeout=VERIFY_TIMEOUT, allow_redirects=True)
         except Exception:
             continue
+
         final_url = resp.url
         final_domain = get_domain(final_url)
         if final_domain in BAD_DOMAINS:
@@ -364,18 +303,15 @@ def verify_candidate(url: str, full_title: str, scope: str) -> Tuple[bool, str, 
         if resp.status_code >= 400:
             continue
 
-        html = resp.text[:250000]
+        html = resp.text[:200000]
         soup = BeautifulSoup(html, "html.parser")
-
         title_tag = soup.title.get_text(" ", strip=True) if soup.title else ""
-        body_text = soup.get_text(" ", strip=True)[:10000]
+        body_text = soup.get_text(" ", strip=True)[:8000]
 
         score = max(
             title_match_score(full_title, title_tag),
             title_match_score(full_title, body_text),
         )
-
-        # Strongly prefer scope-domain matches
         if scope and final_domain.endswith(scope):
             score += 0.2
 
@@ -406,25 +342,30 @@ def load_workbook_sheets(path: str) -> Dict[str, pd.DataFrame]:
     xls = pd.ExcelFile(path)
     return {name: pd.read_excel(path, sheet_name=name) for name in xls.sheet_names}
 
-def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]]) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    if "official_url_status" not in df.columns or "title" not in df.columns:
-        return df, {"patched": 0, "resolved": 0, "unchanged": 0}
-
+def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]], time_start: float) -> Tuple[pd.DataFrame, Dict[str, int], bool]:
     work = df.copy()
+    if "official_url_status" not in work.columns or "title" not in work.columns:
+        return work, {"patched": 0, "resolved": 0, "unchanged": 0, "cache_hit": 0}, False
+
     mask = work["official_url_status"].fillna("").eq("search_no_match")
+    idxs = list(work.index[mask])
     if MAX_MISSING > 0:
-        idxs = list(work.index[mask])[:MAX_MISSING]
-    else:
-        idxs = list(work.index[mask])
+        idxs = idxs[:MAX_MISSING]
 
-    patched = resolved = unchanged = 0
+    stats = {"patched": 0, "resolved": 0, "unchanged": 0, "cache_hit": 0}
+    timed_out = False
 
-    for idx in idxs:
+    for n, idx in enumerate(idxs, start=1):
+        if time.time() - time_start > MAX_RUNTIME_SECONDS:
+            timed_out = True
+            log(f"[resolver] Stop early due to runtime budget after {n-1} rows.")
+            break
+
         title = normalize_text(work.at[idx, "title"])
         plan_source = normalize_text(work.at[idx, "plan_source"]) if "plan_source" in work.columns else ""
         region = normalize_text(work.at[idx, "applicable_region"]) if "applicable_region" in work.columns else ""
+        key = cache_key(title, plan_source, region)
 
-        key = sha1_short(normalize_title_key(title) + "||" + normalize_title_key(plan_source) + "||" + normalize_title_key(region))
         if key in cache:
             hit = cache[key]
             work.at[idx, "organizer_site_url"] = hit["organizer_site_url"]
@@ -433,8 +374,9 @@ def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]]) -> Tuple[pd.Dat
             work.at[idx, "official_organizer_domain"] = hit["official_organizer_domain"]
             work.at[idx, "official_url_status"] = "resolver_cache_hit"
             work.at[idx, "official_url_confidence"] = hit.get("confidence", "high")
-            patched += 1
-            resolved += 1
+            stats["patched"] += 1
+            stats["resolved"] += 1
+            stats["cache_hit"] += 1
             continue
 
         queries = build_queries(title, plan_source, region)
@@ -453,21 +395,22 @@ def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]]) -> Tuple[pd.Dat
                 except Exception:
                     pass
 
-            for u in urls:
+            for u in urls[:4]:
                 if u in seen_urls:
                     continue
                 seen_urls.add(u)
                 candidates.append(Candidate(url=u, query=query, scope=scope, source="search"))
-            if len(candidates) >= 18:
+
+            # runtime-friendly: stop early if we already have enough candidates
+            if len(candidates) >= 6:
                 break
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         best: Optional[Tuple[str, str, float, str, str]] = None
-        for cand in candidates:
+        for cand in candidates[:6]:
             ok, domain, score = verify_candidate(cand.url, title, cand.scope)
-            if ok:
-                if best is None or score > best[2]:
-                    best = (cand.url, domain, score, cand.query, cand.scope)
+            if ok and (best is None or score > best[2]):
+                best = (cand.url, domain, score, cand.query, cand.scope)
 
         if best:
             url, domain, score, query, scope = best
@@ -477,7 +420,6 @@ def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]]) -> Tuple[pd.Dat
             work.at[idx, "official_organizer_domain"] = domain
             work.at[idx, "official_url_status"] = "resolver_verified_title_exact"
             work.at[idx, "official_url_confidence"] = "high" if score >= 0.95 else "medium"
-
             cache[key] = {
                 "title": title,
                 "plan_source": plan_source,
@@ -490,34 +432,37 @@ def patch_df(df: pd.DataFrame, cache: Dict[str, Dict[str, Any]]) -> Tuple[pd.Dat
                 "query": query,
                 "scope": scope,
             }
-            patched += 1
-            resolved += 1
+            stats["patched"] += 1
+            stats["resolved"] += 1
         else:
-            unchanged += 1
+            stats["unchanged"] += 1
 
-    return work, {"patched": patched, "resolved": resolved, "unchanged": unchanged}
+    return work, stats, timed_out
 
-def update_delta_workbook(path: str, cache: Dict[str, Dict[str, Any]]) -> Optional[str]:
+def update_delta_workbook(path: str, cache: Dict[str, Dict[str, Any]], time_start: float) -> Tuple[bool, bool]:
     p = Path(path)
     if not p.exists():
-        return None
+        return False, False
     sheets = load_workbook_sheets(path)
     changed = False
+    timed_out = False
     for sheet in ("new_plans", "updated_plans"):
         if sheet in sheets and not sheets[sheet].empty:
-            patched_df, stats = patch_df(sheets[sheet], cache)
+            patched_df, stats, t = patch_df(sheets[sheet], cache, time_start)
+            timed_out = timed_out or t
             if stats["patched"] > 0:
                 sheets[sheet] = patched_df
                 changed = True
-    if not changed:
-        return None
-
-    with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=name[:31])
-    return path
+            if timed_out:
+                break
+    if changed:
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            for name, df in sheets.items():
+                df.to_excel(writer, index=False, sheet_name=name[:31])
+    return changed, timed_out
 
 def main() -> None:
+    started = time.time()
     input_path = Path(INPUT_XLSX)
     if not input_path.exists():
         raise FileNotFoundError(f"Input workbook not found: {INPUT_XLSX}")
@@ -525,21 +470,23 @@ def main() -> None:
     cache = load_cache(CACHE_JSON)
     sheets = load_workbook_sheets(INPUT_XLSX)
 
-    summary_stats = {"patched": 0, "resolved": 0, "unchanged": 0}
-    detail_stats = {"patched": 0, "resolved": 0, "unchanged": 0}
+    summary_stats = {"patched": 0, "resolved": 0, "unchanged": 0, "cache_hit": 0}
+    detail_stats = {"patched": 0, "resolved": 0, "unchanged": 0, "cache_hit": 0}
+    timed_out = False
 
     if "grants_summary" in sheets:
-        sheets["grants_summary"], summary_stats = patch_df(sheets["grants_summary"], cache)
+        sheets["grants_summary"], summary_stats, timed_out = patch_df(sheets["grants_summary"], cache, started)
 
-    if "grants_detail" in sheets:
-        sheets["grants_detail"], detail_stats = patch_df(sheets["grants_detail"], cache)
+    if "grants_detail" in sheets and not timed_out:
+        sheets["grants_detail"], detail_stats, timed_out = patch_df(sheets["grants_detail"], cache, started)
 
     with pd.ExcelWriter(INPUT_XLSX, engine="openpyxl") as writer:
         for name, df in sheets.items():
             df.to_excel(writer, index=False, sheet_name=name[:31])
 
     save_cache(CACHE_JSON, cache)
-    delta_updated = update_delta_workbook(DELTA_XLSX, cache)
+    delta_updated, delta_timed_out = update_delta_workbook(DELTA_XLSX, cache, started)
+    timed_out = timed_out or delta_timed_out
 
     result = {
         "input_xlsx": INPUT_XLSX,
@@ -547,11 +494,15 @@ def main() -> None:
         "summary_patched": summary_stats["patched"],
         "summary_resolved": summary_stats["resolved"],
         "summary_unchanged": summary_stats["unchanged"],
+        "summary_cache_hit": summary_stats["cache_hit"],
         "detail_patched": detail_stats["patched"],
         "detail_resolved": detail_stats["resolved"],
         "detail_unchanged": detail_stats["unchanged"],
+        "detail_cache_hit": detail_stats["cache_hit"],
         "delta_updated": bool(delta_updated),
         "cache_size": len(cache),
+        "timed_out_early": timed_out,
+        "elapsed_seconds": round(time.time() - started, 1),
     }
     print(json.dumps(result, ensure_ascii=False))
 
